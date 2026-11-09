@@ -838,6 +838,7 @@
     "us_treasury_name": "美国财政部（计算）",
     "providerDescriptions": {
       "MOEX": "Moscow Exchange ISS 提供 MOEX 上交易的股票、存托凭证和 ETF 的延迟行情及收盘价。无需 API 密钥。",
+      "CDG_CAPITAL": "CDG Capital Bourse 通过其网站的非官方公开 API，提供卡萨布兰卡证券交易所上市股票的最新行情及收盘价。无需 API 密钥。",
       "YAHOO": "Yahoo Finance 提供多个市场的历史及实时股票数据。",
       "MARKETDATA_APP": "MarketData.app 提供美国股票、期权、ETF、共同基金等的实时和历史数据。",
       "ALPHA_VANTAGE": "Alpha Vantage 为股票、外汇和加密货币的实时和历史数据提供免费的 API。",

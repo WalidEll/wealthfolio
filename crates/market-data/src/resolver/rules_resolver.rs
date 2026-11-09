@@ -114,7 +114,9 @@ impl RulesResolver {
 
         // ISS addresses a MOEX security by its bare SECID; coverage already
         // limits this provider to MISX, so the ticker is not a guess.
-        if provider.as_ref() == "MOEX" {
+        // CDG Capital Bourse likewise addresses an XCAS share by its bare
+        // ticker, and coverage limits that provider to XCAS.
+        if provider.as_ref() == "MOEX" || provider.as_ref() == "CDG_CAPITAL" {
             return Some((
                 ProviderInstrument::EquitySymbol {
                     symbol: ticker.clone(),
@@ -967,6 +969,32 @@ mod tests {
             ProviderInstrument::EquitySymbol { symbol } => assert_eq!(symbol.as_ref(), "AFLT"),
             _ => panic!("Expected EquitySymbol"),
         }
+    }
+
+    #[test]
+    fn test_resolve_equity_cdg_capital_uses_trusted_ticker() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("ATW", Some("XCAS"));
+
+        let resolved = resolver
+            .resolve(&"CDG_CAPITAL".into(), &context)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.source, ResolutionSource::Rules);
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => assert_eq!(symbol.as_ref(), "ATW"),
+            _ => panic!("Expected EquitySymbol"),
+        }
+
+        // The registry knows the venue even though no provider has a suffix for it.
+        use crate::resolver::exchange_metadata::{
+            exchanges_for_currency, mic_to_currency, mic_to_market_close, mic_to_timezone,
+        };
+        assert_eq!(mic_to_currency("XCAS"), Some("MAD"));
+        assert_eq!(mic_to_timezone("XCAS"), Some("Africa/Casablanca"));
+        assert_eq!(mic_to_market_close("XCAS"), Some((15, 30)));
+        assert_eq!(exchanges_for_currency("MAD"), &["XCAS"]);
     }
 
     #[test]

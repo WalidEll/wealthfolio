@@ -829,6 +829,7 @@
     "feature_dividends": "配当",
     "providerDescriptions": {
       "MOEX": "Moscow Exchange ISS は、MOEX で取引される株式、預託証券、ETF の遅延価格と終値を提供します。API キーは不要です。",
+      "CDG_CAPITAL": "CDG Capital Bourse は、ウェブサイトの非公式な公開 API を通じて、カサブランカ証券取引所に上場している株式の最新価格と終値を提供します。API キーは不要です。",
       "YAHOO": "Yahoo Finance は、多くの市場を対象とする大手金融データ プロバイダーです。過去およびリアルタイムの株式データを提供します。",
       "MARKETDATA_APP": "MarketData.app は、米国株、オプション、ETF、投資信託などのリアルタイム データと履歴データを提供します。",
       "ALPHA_VANTAGE": "Alpha Vantage は、株式、外国為替、暗号通貨に関するリアルタイムおよび履歴データ用の無料 API を提供します。",

@@ -150,3 +150,21 @@ it("translates MOEX descriptions and receipt capabilities", () => {
     "股票 • ETF • 存托凭证",
   );
 });
+
+it.each(Object.entries(settingsCatalogs))(
+  "localizes the CDG Capital description in %s",
+  (_, catalog) => {
+    expect(catalog.market_data_page.providerDescriptions.CDG_CAPITAL).toBeTruthy();
+  },
+);
+
+it("translates the CDG Capital description and keeps its venue code", () => {
+  expect(
+    getProviderDescription(
+      i18n.getFixedT("zh"),
+      "CDG_CAPITAL",
+      en.market_data_page.providerDescriptions.CDG_CAPITAL,
+    ),
+  ).toBe(zh.market_data_page.providerDescriptions.CDG_CAPITAL);
+  expect(getProviderCoverage(i18n.getFixedT("zh"), "XCAS")).toBe("XCAS");
+});

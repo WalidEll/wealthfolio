@@ -236,6 +236,8 @@
   "editSheet": {
     "moex_symbol_placeholder": "ad es. SBER, AFLT",
     "moex_symbol_hint": "Usa un codice titolo MOEX senza prefisso o suffisso. Imposta la borsa su Moscow Exchange (MISX).",
+    "cdg_capital_symbol_placeholder": "ad es. ATW, IAM",
+    "cdg_capital_symbol_hint": "Usa un codice titolo della Borsa di Casablanca senza prefisso o suffisso. Imposta la borsa su Bourse de Casablanca (XCAS).",
     "identity_conflict": "Un altro asset ha già questa identità. Le modifiche non sono state salvate. Usa l’asset esistente o scegli un’altra borsa.",
     "general": "Generale",
     "classification": "Classificazione",

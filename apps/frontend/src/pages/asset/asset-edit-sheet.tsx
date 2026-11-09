@@ -139,6 +139,18 @@ function getSymbolPlaceholder(provider: string): string {
   return PROVIDER_SYMBOL_HINTS[provider] ?? "e.g. AAPL";
 }
 
+// Exchange-scoped providers take the venue's bare security code; say so where it is typed.
+const VENUE_SYMBOL_HELP: Record<string, { placeholder: string; hint: string }> = {
+  MOEX: {
+    placeholder: "asset:editSheet.moex_symbol_placeholder",
+    hint: "asset:editSheet.moex_symbol_hint",
+  },
+  CDG_CAPITAL: {
+    placeholder: "asset:editSheet.cdg_capital_symbol_placeholder",
+    hint: "asset:editSheet.cdg_capital_symbol_hint",
+  },
+};
+
 function isResolvedByRequestedProvider(
   resolvedProviderId: string | undefined,
   requestedProvider: string | undefined,
@@ -405,6 +417,8 @@ function SymbolMappingRow({
     return () => clearTimeout(timer);
   }, [symbol, provider, instrumentType, exchangeMic, quoteCcy, fieldId, onValidationChange]); // oxlint-disable-line react/exhaustive-deps -- initialSymbol is intentionally captured at mount time only
 
+  const venueSymbolHelp = provider ? VENUE_SYMBOL_HELP[provider] : undefined;
+
   return (
     <tr className="border-b last:border-b-0">
       <td className="px-4 py-2">
@@ -438,8 +452,8 @@ function SymbolMappingRow({
                 <div className="relative flex items-center">
                   <Input
                     placeholder={
-                      provider === "MOEX"
-                        ? t("asset:editSheet.moex_symbol_placeholder")
+                      venueSymbolHelp
+                        ? t(venueSymbolHelp.placeholder)
                         : getSymbolPlaceholder(provider ?? "")
                     }
                     {...{
@@ -467,10 +481,8 @@ function SymbolMappingRow({
                   </span>
                 </div>
               </FormControl>
-              {provider === "MOEX" && (
-                <p className="text-muted-foreground text-xs">
-                  {t("asset:editSheet.moex_symbol_hint")}
-                </p>
+              {venueSymbolHelp && (
+                <p className="text-muted-foreground text-xs">{t(venueSymbolHelp.hint)}</p>
               )}
             </FormItem>
           )}

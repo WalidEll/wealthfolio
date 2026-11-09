@@ -39,10 +39,10 @@ use crate::secrets::SecretStore;
 use wealthfolio_market_data::{
     mic_to_currency, mic_to_exchange_name, yahoo_equity_provider_symbol_to_canonical,
     yahoo_exchange_to_mic, yahoo_suffix_to_mic, AlphaVantageProvider, AmfiProvider,
-    AssetProfile as MarketAssetProfile, BoerseFrankfurtProvider, DividendEvent, ExchangeMap,
-    FinnhubProvider, FixtureProvider, MarketDataAppProvider, MetalPriceApiProvider, MoexProvider,
-    OpenFigiProvider, ProviderId, ProviderRegistry, Quote as MarketQuote, QuoteContext,
-    QuoteIdentifiers, ResolverChain, SearchResult as MarketSearchResult, SplitEvent,
+    AssetProfile as MarketAssetProfile, BoerseFrankfurtProvider, CdgCapitalProvider, DividendEvent,
+    ExchangeMap, FinnhubProvider, FixtureProvider, MarketDataAppProvider, MetalPriceApiProvider,
+    MoexProvider, OpenFigiProvider, ProviderId, ProviderRegistry, Quote as MarketQuote,
+    QuoteContext, QuoteIdentifiers, ResolverChain, SearchResult as MarketSearchResult, SplitEvent,
     UsTreasuryCalcProvider, YahooProvider,
 };
 
@@ -247,6 +247,7 @@ impl MarketDataClient {
             | DATA_SOURCE_FINNHUB
             | DATA_SOURCE_OPENFIGI
             | DATA_SOURCE_AMFI
+            | DATA_SOURCE_CDG_CAPITAL
             | DATA_SOURCE_CUSTOM_SCRAPER => {
                 warn!(
                     "Provider {} is disabled because WEALTHFOLIO_E2E=1; add fixture support before using it in e2e",
@@ -334,6 +335,10 @@ impl MarketDataClient {
             DATA_SOURCE_MOEX => {
                 // Moscow Exchange shares, DRs and ETFs via the public ISS API (no API key)
                 Ok(Some(Arc::new(MoexProvider::new())))
+            }
+            DATA_SOURCE_CDG_CAPITAL => {
+                // Bourse de Casablanca shares via the public CDG Capital Bourse API (no API key)
+                Ok(Some(Arc::new(CdgCapitalProvider::new())))
             }
             _ => {
                 warn!("Unknown provider ID: {}", provider_id);
@@ -1378,6 +1383,40 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.provider_id.as_deref(), Some("ALPHA_VANTAGE"));
+    }
+
+    /// The client builds a provider only for the configs it is given, so with
+    /// no CDG Capital config there is no CDG provider to send a request. That
+    /// only enabled rows reach it is covered by the QuoteService test
+    /// `test_cdg_capital_provider_exists_only_when_its_row_is_enabled`.
+    #[tokio::test]
+    async fn cdg_capital_is_built_only_from_an_enabled_row() {
+        let provider_ids = |client: &MarketDataClient| {
+            client
+                .registry
+                .providers()
+                .iter()
+                .map(|provider| provider.id())
+                .collect::<Vec<_>>()
+        };
+
+        let disabled =
+            MarketDataClient::new_with_extra(Arc::new(NoSecrets), Vec::new(), Vec::new())
+                .await
+                .unwrap();
+        assert!(!provider_ids(&disabled).contains(&DATA_SOURCE_CDG_CAPITAL));
+
+        let enabled = MarketDataClient::new_with_extra(
+            Arc::new(NoSecrets),
+            vec![ProviderConfig {
+                id: DATA_SOURCE_CDG_CAPITAL.to_string(),
+                priority: 14,
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(provider_ids(&enabled), vec![DATA_SOURCE_CDG_CAPITAL]);
     }
 
     #[test]

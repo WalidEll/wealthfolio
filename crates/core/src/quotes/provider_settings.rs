@@ -113,6 +113,17 @@ impl ProviderCapabilities {
                     "Profiles".to_string(),
                 ],
             }),
+            "CDG_CAPITAL" => Some(Self {
+                instruments: "Stocks".to_string(),
+                coverage: "XCAS".to_string(),
+                features: vec![
+                    "Real-time".to_string(),
+                    "Historical".to_string(),
+                    "Search".to_string(),
+                    "Profiles".to_string(),
+                    "No API key".to_string(),
+                ],
+            }),
             "OPENFIGI" => Some(Self {
                 instruments: "Bonds".to_string(),
                 coverage: "Global".to_string(),

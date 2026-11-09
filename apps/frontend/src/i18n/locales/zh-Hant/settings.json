@@ -846,6 +846,7 @@
       "METAL_PRICE_API": "提供貴金屬（黃金、白銀、鉑金、鈀金）的實時和歷史現貨價格。",
       "CUSTOM_SCRAPER": "為使用者自訂資料源提供運行時調度。",
       "MOEX": "Moscow Exchange ISS 提供 MOEX 上交易的股票、存託憑證和 ETF 的延遲行情及收盤價。無需 API 金鑰。",
+      "CDG_CAPITAL": "CDG Capital Bourse 透過其網站的非官方公開 API，提供卡薩布蘭卡證券交易所上市股票的最新行情及收盤價。無需 API 金鑰。",
       "YAHOO": "Yahoo Finance 提供多個市場的歷史及實時股票資料。",
       "MARKETDATA_APP": "MarketData.app 提供美國股票、期權、ETF、共同基金等的實時和歷史資料。",
       "ALPHA_VANTAGE": "Alpha Vantage 為股票、外匯和加密貨幣的實時和歷史資料提供免費的 API。",

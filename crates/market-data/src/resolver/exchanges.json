@@ -863,6 +863,14 @@
       "providers": {
         "YAHOO": { "suffix": ".CA", "codes": ["CAI"] }
       }
+    },
+    {
+      "mic": "XCAS",
+      "name": "Casablanca",
+      "long_name": "Bourse de Casablanca",
+      "currency": "MAD",
+      "timezone": "Africa/Casablanca",
+      "close": [15, 30]
     }
   ],
   "legacy_exchanges": [
@@ -901,6 +909,7 @@
     "ILS": ["XTAE"],
     "ILA": ["XTAE"],
     "ZAR": ["XJSE"],
+    "MAD": ["XCAS"],
     "TWD": ["XTAI", "ROCO"]
   }
 }

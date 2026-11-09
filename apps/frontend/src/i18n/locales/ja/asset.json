@@ -236,6 +236,8 @@
   "editSheet": {
     "moex_symbol_placeholder": "例: SBER, AFLT",
     "moex_symbol_hint": "接頭辞や接尾辞のない MOEX 銘柄コードを使用してください。取引所は Moscow Exchange (MISX) に設定してください。",
+    "cdg_capital_symbol_placeholder": "例: ATW, IAM",
+    "cdg_capital_symbol_hint": "接頭辞や接尾辞のないカサブランカ証券取引所の銘柄コードを使用してください。取引所は Bourse de Casablanca (XCAS) に設定してください。",
     "identity_conflict": "同じ識別情報の資産がすでに存在します。変更は保存されませんでした。既存の資産を使用するか、別の取引所を選択してください。",
     "general": "基本情報",
     "classification": "分類",

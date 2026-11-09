@@ -4415,6 +4415,61 @@ mod tests {
         );
     }
 
+    /// The settings rows decide whether the CDG Capital provider exists: a
+    /// disabled row (how the migration seeds it) yields no provider, so no
+    /// request can be sent to the CDG site until the user enables it.
+    #[tokio::test]
+    async fn test_cdg_capital_provider_exists_only_when_its_row_is_enabled() {
+        let cdg_row = |enabled: bool| MarketDataProviderSetting {
+            id: "CDG_CAPITAL".to_string(),
+            name: "CDG Capital Bourse".to_string(),
+            description: "Casablanca provider".to_string(),
+            url: None,
+            priority: 14,
+            enabled,
+            logo_filename: None,
+            last_synced_at: None,
+            last_sync_status: None,
+            last_sync_error: None,
+            capabilities: None,
+            provider_type: None,
+        };
+        let service_with = |enabled: bool| async move {
+            QuoteService::new(
+                Arc::new(NoopQuoteStore),
+                Arc::new(MockSyncStateStore {
+                    provider_sync_stats: Vec::new(),
+                    with_errors: Vec::new(),
+                    states: Arc::new(Mutex::new(HashMap::new())),
+                }),
+                Arc::new(MockProviderSettingsStore {
+                    providers: vec![cdg_row(enabled)],
+                }),
+                Arc::new(NoopAssetRepository),
+                Arc::new(NoopActivityRepository),
+                Arc::new(MockSecretStore),
+            )
+            .await
+            .unwrap()
+        };
+
+        let disabled = service_with(false).await;
+        assert!(!disabled
+            .client
+            .read()
+            .await
+            .providers()
+            .contains(&"CDG_CAPITAL"));
+
+        let enabled = service_with(true).await;
+        assert!(enabled
+            .client
+            .read()
+            .await
+            .providers()
+            .contains(&"CDG_CAPITAL"));
+    }
+
     #[tokio::test]
     async fn test_reset_sync_state_for_profile_change_clears_errors_and_provider_binding() {
         let now = Utc::now();

@@ -829,6 +829,7 @@
     "feature_dividends": "배당금",
     "providerDescriptions": {
       "MOEX": "Moscow Exchange ISS는 MOEX에서 거래되는 주식, 주식예탁증서 및 ETF의 지연 시세와 종가를 제공합니다. API 키가 필요하지 않습니다.",
+      "CDG_CAPITAL": "CDG Capital Bourse는 웹사이트의 비공식 공개 API를 통해 카사블랑카 증권거래소에 상장된 주식의 최신 시세와 종가를 제공합니다. API 키가 필요하지 않습니다.",
       "YAHOO": "Yahoo Finance는 많은 시장에서 선도적인 금융 데이터 제공업체입니다. 과거 및 실시간 주식 데이터를 제공합니다.",
       "MARKETDATA_APP": "MarketData.app은 미국 주식, 옵션, ETF, 뮤추얼 펀드 등에 대한 실시간 및 과거 데이터를 제공합니다.",
       "ALPHA_VANTAGE": "Alpha Vantage는 주식, 외환 및 암호화폐에 대한 실시간 및 과거 데이터를 위한 무료 API를 제공합니다.",

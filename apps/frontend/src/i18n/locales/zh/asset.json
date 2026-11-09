@@ -236,6 +236,8 @@
   "editSheet": {
     "moex_symbol_placeholder": "例如 SBER、AFLT",
     "moex_symbol_hint": "请使用不带前缀或后缀的 MOEX 证券代码，并将交易所设为 Moscow Exchange (MISX)。",
+    "cdg_capital_symbol_placeholder": "例如 ATW、IAM",
+    "cdg_capital_symbol_hint": "请使用不带前缀或后缀的卡萨布兰卡证券交易所股票代码，并将交易所设为 Bourse de Casablanca (XCAS)。",
     "identity_conflict": "已存在具有相同标识的资产。更改未保存。请使用现有资产或选择其他交易所。",
     "general": "通用",
     "classification": "分类",

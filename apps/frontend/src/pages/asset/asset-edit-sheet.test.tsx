@@ -259,6 +259,21 @@ describe("AssetEditSheet preferred provider hint", () => {
 
     expect(screen.getByText(/which provider to try first/i)).toBeInTheDocument();
   });
+
+  it.each([
+    ["MOEX", "AFLT", "e.g. SBER, AFLT", /Moscow Exchange \(MISX\)/],
+    ["CDG_CAPITAL", "ATW", "e.g. ATW, IAM", /Bourse de Casablanca \(XCAS\)/],
+    ["YAHOO", "AAPL", "e.g. AAPL, LYMS.DE", null],
+  ])("explains the %s symbol format on its mapping row", (provider, symbol, placeholder, hint) => {
+    renderMarketData(buildAsset({ providerConfig: { overrides: { [provider]: { symbol } } } }));
+
+    expect(screen.getByDisplayValue(symbol)).toHaveAttribute("placeholder", placeholder);
+    if (hint) {
+      expect(screen.getByText(hint)).toBeInTheDocument();
+    } else {
+      expect(screen.queryByText(/without a prefix or suffix/i)).not.toBeInTheDocument();
+    }
+  });
 });
 
 describe("AssetEditSheet automatic updates", () => {

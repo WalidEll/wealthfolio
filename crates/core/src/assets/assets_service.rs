@@ -492,6 +492,14 @@ impl AssetService {
             return Some(serde_json::json!({ "preferred_provider": "MOEX" }));
         }
 
+        // Yahoo does not list Bourse de Casablanca shares, so a bare ticker there
+        // would also resolve to an unrelated security on another venue.
+        if matches!(instrument_type, Some(InstrumentType::Equity))
+            && exchange_mic.is_some_and(|mic| mic.trim().eq_ignore_ascii_case("XCAS"))
+        {
+            return Some(serde_json::json!({ "preferred_provider": "CDG_CAPITAL" }));
+        }
+
         None
     }
 
@@ -5755,6 +5763,44 @@ mod tests {
         assert_eq!(usd.exchange_mic.as_deref(), Some("XNAS"));
     }
 
+    /// ATW is Attijariwafa Bank on Casablanca; a foreign listing can share the
+    /// ticker. With both in the search results, a MAD activity picks XCAS and
+    /// keeps CDG_CAPITAL as the provider.
+    #[tokio::test]
+    async fn test_resolve_import_asset_inputs_uses_currency_to_pick_casablanca_listing() {
+        let mut foreign =
+            yahoo_search_result("ATW", "ATW", "XNYS", "Atlantic Wind Inc.", "USD", "ATW");
+        foreign.score = 20_000.0;
+        let mut casablanca =
+            yahoo_search_result("ATW", "ATW", "XCAS", "ATTIJARIWAFA BANK", "MAD", "ATW");
+        casablanca.provider_id = Some("CDG_CAPITAL".to_string());
+        casablanca.data_source = Some("CDG_CAPITAL".to_string());
+        casablanca.score = 0.0;
+        let service = test_asset_service(
+            Vec::new(),
+            TestQuoteService::default().with_result("ATW", vec![foreign, casablanca]),
+        );
+
+        let resolved = |currency: &'static str| {
+            let service = &service;
+            async move {
+                service
+                    .resolve_import_asset_inputs(vec![import_input("ATW", currency)])
+                    .await
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+            }
+        };
+
+        let mad = resolved("MAD").await;
+        assert_eq!(mad.exchange_mic.as_deref(), Some("XCAS"));
+        assert_eq!(mad.name.as_deref(), Some("ATTIJARIWAFA BANK"));
+        assert_eq!(mad.provider_id.as_deref(), Some("CDG_CAPITAL"));
+        let usd = resolved("USD").await;
+        assert_eq!(usd.exchange_mic.as_deref(), Some("XNYS"));
+    }
+
     #[tokio::test]
     async fn test_resolve_import_asset_inputs_existing_isin_returns_canonical_identity() {
         let existing = Asset {
@@ -6274,6 +6320,38 @@ mod tests {
             Some(serde_json::json!({ "preferred_provider": "BOERSE_FRANKFURT" })),
             "ISIN-backed XETR/XFRA equities should prefer Boerse Frankfurt"
         );
+    }
+
+    #[test]
+    fn test_casablanca_equity_prefers_cdg_capital() {
+        let provider_config = AssetService::inferred_provider_config(
+            QuoteMode::Market,
+            Some(&InstrumentType::Equity),
+            Some("ATW"),
+            Some("XCAS"),
+        );
+
+        assert_eq!(
+            provider_config,
+            Some(serde_json::json!({ "preferred_provider": "CDG_CAPITAL" })),
+            "XCAS equities should prefer CDG_CAPITAL"
+        );
+
+        let manual = AssetService::inferred_provider_config(
+            QuoteMode::Manual,
+            Some(&InstrumentType::Equity),
+            Some("ATW"),
+            Some("XCAS"),
+        );
+        assert!(manual.is_none(), "manual assets keep no provider config");
+
+        let elsewhere = AssetService::inferred_provider_config(
+            QuoteMode::Market,
+            Some(&InstrumentType::Equity),
+            Some("ATW"),
+            Some("XPAR"),
+        );
+        assert!(elsewhere.is_none(), "only XCAS listings prefer CDG_CAPITAL");
     }
 
     #[test]

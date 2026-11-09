@@ -2800,4 +2800,18 @@ mod tests {
             .expect("get_latest_quotes_as_of should succeed with empty result");
         assert!(empty.is_empty(), "no quotes before all rows");
     }
+
+    /// The CDG Capital API is unofficial, so the provider stays off until the
+    /// user enables it; the quote service builds providers from enabled rows only.
+    #[tokio::test]
+    async fn cdg_capital_provider_is_seeded_disabled() {
+        let (repo, _temp) = create_test_repository().await;
+
+        let provider = repo.get_provider("CDG_CAPITAL").unwrap();
+
+        assert!(!provider.enabled);
+        assert_eq!(provider.priority, 14);
+        assert_eq!(provider.logo_filename.as_deref(), Some("cdg-capital.svg"));
+        assert_eq!(provider.provider_type.as_deref(), Some("builtin"));
+    }
 }

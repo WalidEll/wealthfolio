@@ -813,6 +813,7 @@
       "METAL_PRICE_API": "Bietet Echtzeit- und historische Spotpreise für Edelmetalle (Gold, Silber, Platin, Palladium).",
       "CUSTOM_SCRAPER": "Laufzeit-Dispatch-Provider für benutzerdefinierte benutzerdefinierte Quellen",
       "MOEX": "Moscow Exchange ISS liefert verzögerte Kurse und Schlusskurse für Aktien, Hinterlegungsscheine und ETFs, die an der MOEX gehandelt werden. Kein API-Schlüssel erforderlich.",
+      "CDG_CAPITAL": "CDG Capital Bourse liefert aktuelle Kurse und Schlusskurse für Aktien, die an der Börse Casablanca notiert sind, über die inoffizielle öffentliche API seiner Website. Kein API-Schlüssel erforderlich.",
       "YAHOO": "Yahoo Finance ist ein führender Finanzdatenanbieter für viele Märkte. Es liefert historische und Echtzeit-Bestandsdaten.",
       "MARKETDATA_APP": "MarketData.app bietet Echtzeit- und historische Daten für US-Aktien, Optionen, ETFs, Investmentfonds und mehr.",
       "ALPHA_VANTAGE": "Alpha Vantage bietet kostenlose APIs für Echtzeit- und historische Daten zu Aktien, Devisen und Kryptowährungen.",

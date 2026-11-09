@@ -867,6 +867,7 @@
     "feature_dividends": "Dividendos",
     "providerDescriptions": {
       "MOEX": "O Moscow Exchange ISS fornece cotações com atraso e de fechamento para ações, certificados de depósito e ETFs negociados na MOEX. Não é necessária uma chave de API.",
+      "CDG_CAPITAL": "O CDG Capital Bourse fornece cotações recentes e de fechamento para ações listadas na Bolsa de Casablanca, por meio da API pública não oficial do seu site. Não é necessária uma chave de API.",
       "YAHOO": "O Yahoo Finance é um fornecedor líder de dados financeiros para muitos mercados. Ele fornece dados históricos e de estoque em tempo real.",
       "MARKETDATA_APP": "MarketData.app fornece dados históricos e em tempo real para ações, opções, ETFs, fundos mútuos dos EUA e muito mais.",
       "ALPHA_VANTAGE": "Alpha Vantage fornece APIs gratuitas para dados históricos e em tempo real sobre ações, forex e criptomoedas.",

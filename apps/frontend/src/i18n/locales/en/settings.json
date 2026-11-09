@@ -799,6 +799,7 @@
     "failed_count_other": "{{count}} failed",
     "providerDescriptions": {
       "MOEX": "Moscow Exchange ISS provides delayed and end-of-day prices for shares, depositary receipts and ETFs traded on MOEX. No API key required.",
+      "CDG_CAPITAL": "CDG Capital Bourse provides latest and end-of-day prices for shares listed on the Casablanca Stock Exchange, through its unofficial public website API. No API key required.",
       "YAHOO": "Yahoo Finance is a leading financial data provider for many markets. It provides historical and real-time stock data.",
       "MARKETDATA_APP": "MarketData.app provides real-time and historical data for U.S. stocks, options, ETFs, mutual funds, and more.",
       "ALPHA_VANTAGE": "Alpha Vantage provides free APIs for real-time and historical data on stocks, forex, and cryptocurrencies.",
