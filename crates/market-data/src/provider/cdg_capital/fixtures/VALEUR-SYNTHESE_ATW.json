@@ -1,0 +1,42 @@
+[
+  {
+    "VALEUR-SYNTHESE": {
+      "Valid": true,
+      "Data": [
+        {
+          "Symbol": "ATW",
+          "Libelle": "ATTIJARIWAFA BANK",
+          "Cours": 690.2,
+          "DateCours": "09/11/2026 14:36:47",
+          "Ising": "MA0000012445",
+          "Cotation": "Active",
+          "Phase": "Regular Trading",
+          "VariationP": -0.63,
+          "VariationV": "",
+          "PTO": "",
+          "Ouverture": 693.9,
+          "VTO": "",
+          "SeuilHaut": 710.9,
+          "SeuilBas": 669.5,
+          "PlusHaut": 694,
+          "PlusBas": 682,
+          "CMP": 692.6989,
+          "NbrTitre": 20845,
+          "NbrTransaction": 93,
+          "Volume": 14439308.9,
+          "PourcentageAchat": 26,
+          "PourcentageVente": 73,
+          "CoursVeille": 694.6,
+          "DateCoursDAnnee": "31/12/2025 00:00:00",
+          "CoursDAnnee": "",
+          "VariationPDAnnee": -35.5,
+          "VariationVPDAnnee": -4.86,
+          "PlusHautDAnnee": 764.5,
+          "PlusBasDAnnee": 662.9,
+          "Capitalisation": 148490207077.8,
+          "DateJour": "09/11/2026 14:55:04"
+        }
+      ]
+    }
+  }
+]

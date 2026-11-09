@@ -1,0 +1,61 @@
+[
+  {
+    "QUICK-SEARCH": {
+      "Valid": true,
+      "Data": [
+        {
+          "Id": "",
+          "Symbol": "CIH",
+          "Libelle": "Crédit Immobilier et Hôtelier",
+          "DateCotation": "09/11/2026 14:30:03",
+          "DernierCours": 310,
+          "Variation": 0,
+          "Premier": 311.1,
+          "PlusHaut": 317.4,
+          "PlusBas": 309,
+          "NbrEchange": 10273,
+          "type": "A"
+        },
+        {
+          "Id": 830,
+          "Symbol": "MA0000042426",
+          "Libelle": "FCP CIH ACTIONS",
+          "DateCotation": "18/06/2027 00:00:00",
+          "DernierCours": 2531.13,
+          "Variation": "",
+          "Premier": "",
+          "PlusHaut": "",
+          "PlusBas": "",
+          "NbrEchange": "",
+          "type": "O"
+        },
+        {
+          "Id": 835,
+          "Symbol": "MA0000042434",
+          "Libelle": "FCP CIH CASH",
+          "DateCotation": "18/06/2027 00:00:00",
+          "DernierCours": 1558.49,
+          "Variation": "",
+          "Premier": "",
+          "PlusHaut": "",
+          "PlusBas": "",
+          "NbrEchange": "",
+          "type": "O"
+        },
+        {
+          "Id": 833,
+          "Symbol": "MA0000042442",
+          "Libelle": "FCP CIH EPARGNE",
+          "DateCotation": "18/06/2027 00:00:00",
+          "DernierCours": 2146.97,
+          "Variation": "",
+          "Premier": "",
+          "PlusHaut": "",
+          "PlusBas": "",
+          "NbrEchange": "",
+          "type": "O"
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,41 @@
+[
+  {
+    "VALEUR-GRAPH-APPL": {
+      "Valid": true,
+      "Data": [
+        {
+          "DateCotation": "10/11/2023 00:00:00",
+          "Ouverture": 457.5,
+          "PlusHaut": 457.5,
+          "PlusBas": 457.35,
+          "Cloture": 458,
+          "Volume": 44874354.5
+        },
+        {
+          "DateCotation": "13/11/2023 00:00:00",
+          "Ouverture": 456.1,
+          "PlusHaut": 456.1,
+          "PlusBas": 455.25,
+          "Cloture": 458.35,
+          "Volume": 2011696.9
+        },
+        {
+          "DateCotation": "14/11/2023 00:00:00",
+          "Ouverture": 456,
+          "PlusHaut": 456,
+          "PlusBas": 456,
+          "Cloture": 460,
+          "Volume": 2875084.1
+        },
+        {
+          "DateCotation": "15/11/2023 00:00:00",
+          "Ouverture": 456.1,
+          "PlusHaut": 456.1,
+          "PlusBas": 456.1,
+          "Cloture": 460,
+          "Volume": 5919084.35
+        }
+      ]
+    }
+  }
+]

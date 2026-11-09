@@ -1,0 +1,49 @@
+[
+  {
+    "VALEUR-SESSIONS": {
+      "Valid": true,
+      "Data": [
+        {
+          "Cours": 694.6,
+          "DateCours": "05/11/2026 00:00:00",
+          "Ouverture": 670,
+          "PlusHaut": 694.6,
+          "PlusBas": 670,
+          "Qte": 34194
+        },
+        {
+          "Cours": 670,
+          "DateCours": "04/11/2026 00:00:00",
+          "Ouverture": 669.8,
+          "PlusHaut": 674.9,
+          "PlusBas": 665.5,
+          "Qte": 28445
+        },
+        {
+          "Cours": 662.9,
+          "DateCours": "03/11/2026 00:00:00",
+          "Ouverture": 664,
+          "PlusHaut": 667.9,
+          "PlusBas": 661,
+          "Qte": 36301
+        },
+        {
+          "Cours": 668.3,
+          "DateCours": "02/11/2026 00:00:00",
+          "Ouverture": 665,
+          "PlusHaut": 670,
+          "PlusBas": 664.1,
+          "Qte": 4273
+        },
+        {
+          "Cours": 665,
+          "DateCours": "30/10/2026 00:00:00",
+          "Ouverture": 671,
+          "PlusHaut": 677,
+          "PlusBas": 662,
+          "Qte": 71222
+        }
+      ]
+    }
+  }
+]

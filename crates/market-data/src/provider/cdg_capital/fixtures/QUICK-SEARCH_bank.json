@@ -1,0 +1,61 @@
+[
+  {
+    "QUICK-SEARCH": {
+      "Valid": true,
+      "Data": [
+        {
+          "Id": "",
+          "Symbol": "ATW",
+          "Libelle": "ATTIJARIWAFA BANK",
+          "DateCotation": "09/11/2026 14:36:47",
+          "DernierCours": 690.2,
+          "Variation": -0.63,
+          "Premier": 693.9,
+          "PlusHaut": 694,
+          "PlusBas": 682,
+          "NbrEchange": 20845,
+          "type": "A"
+        },
+        {
+          "Id": "",
+          "Symbol": "BOA",
+          "Libelle": "BANK OF AFRICA",
+          "DateCotation": "09/11/2026 14:38:22",
+          "DernierCours": 195,
+          "Variation": -0.26,
+          "Premier": 195.5,
+          "PlusHaut": 195.5,
+          "PlusBas": 190,
+          "NbrEchange": 28984,
+          "type": "A"
+        },
+        {
+          "Id": "",
+          "Symbol": "BANK",
+          "Libelle": "BANQUES",
+          "DateCotation": "31/12/2025 00:00:00",
+          "DernierCours": 16417.3731,
+          "Variation": 489.7579,
+          "Premier": "",
+          "PlusHaut": "",
+          "PlusBas": "",
+          "NbrEchange": "",
+          "type": "I"
+        },
+        {
+          "Id": "",
+          "Symbol": "CFG",
+          "Libelle": "CFG BANK",
+          "DateCotation": "09/11/2026 14:29:59",
+          "DernierCours": 192.5,
+          "Variation": -2.78,
+          "Premier": 198,
+          "PlusHaut": 198,
+          "PlusBas": 190.6,
+          "NbrEchange": 3573,
+          "type": "A"
+        }
+      ]
+    }
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "QUICK-SEARCH": {
+      "Valid": true,
+      "Data": [
+        {
+          "Id": "",
+          "Symbol": "ATW",
+          "Libelle": "ATTIJARIWAFA BANK",
+          "DateCotation": "09/11/2026 14:36:47",
+          "DernierCours": 690.2,
+          "Variation": -0.63,
+          "Premier": 693.9,
+          "PlusHaut": 694,
+          "PlusBas": 682,
+          "NbrEchange": 20845,
+          "type": "A"
+        }
+      ]
+    }
+  }
+]

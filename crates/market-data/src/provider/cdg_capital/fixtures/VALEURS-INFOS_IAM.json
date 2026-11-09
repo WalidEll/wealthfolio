@@ -1,0 +1,21 @@
+[
+  {
+    "VALEURS-INFOS": {
+      "Valid": true,
+      "Data": [
+        {
+          "Presentation": "Maroc Telecom est issu de la scission de l'Office National des Postes et Télécommunications suite à la promulgation de la loi 24-96 et des décrets d'application relatifs aux télécommunications. Maroc Telecom, premier opérateur global de télécommunications du Royaume du Maroc, est organisé autour de  [truncated for fixture]",
+          "Mnemonique": "IAM",
+          "DateIntroduction": "13/12/2004 00:00:00",
+          "SiteInternet": "www.iam.ma",
+          "NomLogo": "",
+          "DateConstitution": "03/02/1998 00:00:00",
+          "DateDetachementDividende": "04/09/2026 00:00:00",
+          "CapitalSocial": 5274572040,
+          "ValeurNominal": 6,
+          "Secteur": "Télécommunications"
+        }
+      ]
+    }
+  }
+]

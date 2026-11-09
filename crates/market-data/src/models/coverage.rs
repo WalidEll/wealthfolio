@@ -159,6 +159,17 @@ impl Coverage {
         }
     }
 
+    /// Bourse de Casablanca equities only, strict mode.
+    /// Rejects mic=None: a bare ticker is not proof of a Casablanca listing.
+    pub const fn casablanca() -> Self {
+        Self {
+            equity_mic_allow: Some(&["XCAS"]),
+            equity_mic_deny: None,
+            allow_unknown_mic: false,
+            metal_quote_ccy_allow: None,
+        }
+    }
+
     /// Metals only, USD quotes only.
     pub const fn metals_usd_only() -> Self {
         Self {
@@ -275,6 +286,26 @@ mod tests {
             mic: Some(Cow::Borrowed("XNAS")),
         };
         assert!(!coverage.supports(&inst));
+    }
+
+    #[test]
+    fn test_casablanca_accepts_only_xcas() {
+        let coverage = Coverage::casablanca();
+        let xcas = InstrumentId::Equity {
+            ticker: Arc::from("ATW"),
+            mic: Some(Cow::Borrowed("XCAS")),
+        };
+        let xpar = InstrumentId::Equity {
+            ticker: Arc::from("ATW"),
+            mic: Some(Cow::Borrowed("XPAR")),
+        };
+        let bare = InstrumentId::Equity {
+            ticker: Arc::from("ATW"),
+            mic: None,
+        };
+        assert!(coverage.supports(&xcas));
+        assert!(!coverage.supports(&xpar));
+        assert!(!coverage.supports(&bare));
     }
 
     #[test]

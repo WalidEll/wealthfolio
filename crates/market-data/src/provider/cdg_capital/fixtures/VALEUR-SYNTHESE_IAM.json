@@ -1,0 +1,42 @@
+[
+  {
+    "VALEUR-SYNTHESE": {
+      "Valid": true,
+      "Data": [
+        {
+          "Symbol": "IAM",
+          "Libelle": "ITISSALAT AL-MAGHRIB",
+          "Cours": 89.51,
+          "DateCours": "09/11/2026 14:15:36",
+          "Ising": "MA0000011488",
+          "Cotation": "Active",
+          "Phase": "Regular Trading",
+          "VariationP": 0.69,
+          "VariationV": "",
+          "PTO": "",
+          "Ouverture": 90.48,
+          "VTO": "",
+          "SeuilHaut": 92.19,
+          "SeuilBas": 86.83,
+          "PlusHaut": 90.48,
+          "PlusBas": 89.5,
+          "CMP": 89.6071,
+          "NbrTitre": 35635,
+          "NbrTransaction": 97,
+          "Volume": 3193150.64,
+          "PourcentageAchat": 50,
+          "PourcentageVente": 49,
+          "CoursVeille": 88.9,
+          "DateCoursDAnnee": "31/12/2025 00:00:00",
+          "CoursDAnnee": "",
+          "VariationPDAnnee": -20.1,
+          "VariationVPDAnnee": -18.44,
+          "PlusHautDAnnee": 114.4,
+          "PlusBasDAnnee": 83,
+          "Capitalisation": 78687823883.4,
+          "DateJour": "09/11/2026 14:56:16"
+        }
+      ]
+    }
+  }
+]

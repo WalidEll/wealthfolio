@@ -1,0 +1,42 @@
+[
+  {
+    "VALEUR-SYNTHESE": {
+      "Valid": true,
+      "Data": [
+        {
+          "Symbol": "CIH",
+          "Libelle": "Crédit Immobilier et Hôtelier",
+          "Cours": 310,
+          "DateCours": "09/11/2026 14:30:03",
+          "Ising": "MA0000011454",
+          "Cotation": "Active",
+          "Phase": "Regular Trading",
+          "VariationP": 0,
+          "VariationV": "",
+          "PTO": "",
+          "Ouverture": 311.1,
+          "VTO": "",
+          "SeuilHaut": 319.25,
+          "SeuilBas": 300.75,
+          "PlusHaut": 317.4,
+          "PlusBas": 309,
+          "CMP": 310.0802,
+          "NbrTitre": 10273,
+          "NbrTransaction": 26,
+          "Volume": 3185454.1,
+          "PourcentageAchat": 33,
+          "PourcentageVente": 66,
+          "CoursVeille": 310,
+          "DateCoursDAnnee": "31/12/2025 00:00:00",
+          "CoursDAnnee": "",
+          "VariationPDAnnee": -105,
+          "VariationVPDAnnee": -25.3,
+          "PlusHautDAnnee": 413.5,
+          "PlusBasDAnnee": 290.5,
+          "Capitalisation": 11978814780,
+          "DateJour": "09/11/2026 14:56:17"
+        }
+      ]
+    }
+  }
+]

@@ -2246,6 +2246,40 @@ mod tests {
         assert_eq!(registry.ordered_providers(&unknown_context, true).len(), 0);
     }
 
+    /// A ticker shared with another venue, or one without a venue, must never
+    /// reach the Casablanca provider; only an XCAS listing is sent there.
+    #[test]
+    fn test_cdg_capital_is_selected_only_for_xcas() {
+        let providers: Vec<Arc<dyn MarketDataProvider>> = vec![Arc::new(
+            crate::provider::cdg_capital::CdgCapitalProvider::new(),
+        )];
+        let registry = ProviderRegistry::new(providers, Arc::new(MockResolver));
+        let context = |mic: Option<&'static str>| QuoteContext {
+            instrument: InstrumentId::Equity {
+                ticker: Arc::from("ATW"),
+                mic: mic.map(Cow::Borrowed),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        };
+
+        for for_historical in [false, true] {
+            let xcas = registry.ordered_providers(&context(Some("XCAS")), for_historical);
+            assert_eq!(xcas.len(), 1);
+            assert_eq!(xcas[0].id(), "CDG_CAPITAL");
+            assert!(registry
+                .ordered_providers(&context(Some("XPAR")), for_historical)
+                .is_empty());
+            assert!(registry
+                .ordered_providers(&context(None), for_historical)
+                .is_empty());
+        }
+    }
+
     #[test]
     fn test_custom_priorities_override_defaults() {
         // Providers with hardcoded priorities: 5, 10, 20

@@ -1,0 +1,21 @@
+[
+  {
+    "VALEURS-INFOS": {
+      "Valid": true,
+      "Data": [
+        {
+          "Presentation": "Attijariwafa Bank est le premier groupe bancaire et financier du Maghreb. Ce groupe dédie ces services aux particuliers et aux grandes entreprises mais aussi aux PME/PMI. A travers des filiales spécialisées, le Groupe opère dans tous les métiers financiers qui sont l'assurance, le crédit immobilier, [truncated for fixture]",
+          "Mnemonique": "ATW",
+          "DateIntroduction": "13/08/1943 00:00:00",
+          "SiteInternet": "www.attijariwafabank.com",
+          "NomLogo": "",
+          "DateConstitution": "01/01/1911 00:00:00",
+          "DateDetachementDividende": "08/07/2026 00:00:00",
+          "CapitalSocial": 2151408390,
+          "ValeurNominal": 10,
+          "Secteur": "Banques"
+        }
+      ]
+    }
+  }
+]
