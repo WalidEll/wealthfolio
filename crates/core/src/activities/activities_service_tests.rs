@@ -288,8 +288,13 @@ pub(crate) mod tests {
                     .clone()
                     .or_else(|| spec.instrument_symbol.clone())
                     .unwrap_or_else(|| "CREATED".to_string());
+                // Preserve existing test IDs; distinct assets still need unique IDs.
+                let mut id = format!("created-{}", symbol);
+                if assets.iter().any(|asset| asset.id == id) {
+                    id = uuid::Uuid::new_v4().to_string();
+                }
                 let created = Asset {
-                    id: format!("created-{}", symbol),
+                    id,
                     display_code: Some(symbol.clone()),
                     instrument_symbol: spec.instrument_symbol.clone(),
                     instrument_exchange_mic: spec.instrument_exchange_mic.clone(),
@@ -357,6 +362,20 @@ pub(crate) mod tests {
                             .as_ref()
                             .map(|(_, mic, _, _, _)| mic.clone());
                     }
+                    // AMFI's scheme 120505 resolves as the real resolver does: no
+                    // exchange, and identified by AMFI's own scheme code.
+                    let provider_id = if source_symbol == "120505" {
+                        Some("AMFI".to_string())
+                    } else {
+                        provider_resolution.as_ref().map(|_| "YAHOO".to_string())
+                    };
+                    let provider_symbol = if source_symbol == "120505" {
+                        Some(source_symbol.clone())
+                    } else {
+                        provider_resolution
+                            .as_ref()
+                            .map(|(_, _, _, _, symbol)| symbol.clone())
+                    };
 
                     let mut instrument_type = input.instrument_type.clone().or_else(|| {
                         if parse_crypto_pair_symbol(base_symbol).is_some()
@@ -532,14 +551,14 @@ pub(crate) mod tests {
                         instrument_symbol: Some(canonical_symbol.clone()),
                         instrument_exchange_mic: exchange_mic.clone(),
                         provider_config: None,
-                        provider_id: provider_resolution.as_ref().map(|_| "YAHOO".to_string()),
-                        provider_symbol: provider_resolution
-                            .as_ref()
-                            .map(|(_, _, _, _, symbol)| symbol.clone()),
+                        provider_id: provider_id.clone(),
+                        provider_symbol: provider_symbol.clone(),
                         notes: None,
                         metadata: None,
                     });
 
+                    let resolves_without_exchange =
+                        source_symbol == "120505" && existing_asset_id.is_none();
                     AssetResolutionOutput {
                         key: input.key,
                         source_symbol,
@@ -549,12 +568,11 @@ pub(crate) mod tests {
                         quote_ccy_source: Some(quote_ccy_source),
                         instrument_type,
                         kind: Some(kind),
-                        provider_id: provider_resolution.as_ref().map(|_| "YAHOO".to_string()),
-                        provider_symbol: provider_resolution
-                            .as_ref()
-                            .map(|(_, _, _, _, symbol)| symbol.clone()),
+                        provider_id: provider_id.clone(),
+                        provider_symbol: provider_symbol.clone(),
                         provider_config: None,
                         review_symbol,
+                        resolves_without_exchange,
                         existing_asset_id,
                         name,
                         draft,
@@ -1769,8 +1787,8 @@ pub(crate) mod tests {
                     fx_rate: new_activity.fx_rate,
                     notes: new_activity.notes,
                     metadata,
-                    source_system: None,
-                    source_record_id: None,
+                    source_system: new_activity.source_system,
+                    source_record_id: new_activity.source_record_id,
                     source_group_id: new_activity.source_group_id,
                     idempotency_key: new_activity.idempotency_key,
                     import_run_id: new_activity.import_run_id,
@@ -4665,6 +4683,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -5034,6 +5054,314 @@ pub(crate) mod tests {
         // 2 contracts x 10 x 100 multiplier, not 2 x 10 x 1.
         assert_eq!(updated.amount, Some(dec!(2000)));
         assert!(!updated.needs_review);
+    }
+
+    /// Saves a grid edit of a stored BUY of 1 at 10: the grid sends the row's
+    /// stored asset id next to the symbol in the cell.
+    async fn save_grid_symbol_edit(
+        stored_asset: Asset,
+        stored_amount: Decimal,
+        asset: AssetResolutionInput,
+    ) -> Activity {
+        let account_service = Arc::new(MockAccountService::new());
+        let asset_service = Arc::new(MockAssetService::new());
+        let activity_repository = Arc::new(MockActivityRepository::new());
+        account_service.add_account(create_test_account("acc-usd", "USD"));
+        let mut existing =
+            create_stored_activity("grid-row", "acc-usd", Some(stored_asset.id.as_str()));
+        asset_service.add_asset(stored_asset);
+        existing.quantity = Some(dec!(1));
+        existing.unit_price = Some(dec!(10));
+        existing.fee = Some(dec!(0));
+        existing.amount = Some(stored_amount);
+        activity_repository.add_activity(existing);
+        let activity_service = ActivityService::new(
+            activity_repository,
+            account_service,
+            asset_service,
+            Arc::new(MockFxService::new()),
+            Arc::new(MockQuoteService),
+        );
+
+        let result = activity_service
+            .bulk_mutate_activities(ActivityBulkMutationRequest {
+                creates: vec![],
+                updates: vec![ActivityUpdate {
+                    unlink_transfer_pair_id: None,
+                    split_review: None,
+                    id: "grid-row".to_string(),
+                    account_id: "acc-usd".to_string(),
+                    asset: Some(asset),
+                    activity_type: "BUY".to_string(),
+                    subtype: None,
+                    activity_date: "2024-01-15".to_string(),
+                    quantity: Some(Some(dec!(1))),
+                    unit_price: Some(Some(dec!(10))),
+                    currency: "USD".to_string(),
+                    fee: Some(Some(dec!(0))),
+                    tax: None,
+                    amount: None,
+                    status: None,
+                    needs_review: None,
+                    notes: None,
+                    fx_rate: None,
+                    metadata: None,
+                }],
+                delete_ids: vec![],
+            })
+            .await
+            .expect("bulk mutation reports row errors");
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        result.updated.into_iter().next().expect("updated row")
+    }
+
+    #[tokio::test]
+    async fn grid_edit_to_unheld_option_with_stored_id_uses_option_multiplier() {
+        let updated = save_grid_symbol_edit(
+            create_test_asset_with_instrument(
+                "asset-aapl",
+                "AAPL",
+                Some("XNAS"),
+                Some(InstrumentType::Equity),
+                "USD",
+            ),
+            dec!(10),
+            AssetResolutionInput {
+                id: Some("asset-aapl".to_string()),
+                symbol: Some("AAPL260619C00150000".to_string()),
+                instrument_type: Some("OPTION".to_string()),
+                quote_ccy: Some("USD".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_ne!(updated.asset_id.as_deref(), Some("asset-aapl"));
+        assert_eq!(updated.amount, Some(dec!(1000)));
+    }
+
+    #[tokio::test]
+    async fn grid_edit_from_option_to_unheld_equity_with_stored_id_drops_multiplier() {
+        let updated = save_grid_symbol_edit(
+            create_test_asset_with_instrument(
+                "asset-opt",
+                "AAPL260619C00150000",
+                None,
+                Some(InstrumentType::Option),
+                "USD",
+            ),
+            dec!(1000),
+            AssetResolutionInput {
+                id: Some("asset-opt".to_string()),
+                symbol: Some("AAPL".to_string()),
+                exchange_mic: Some("XNAS".to_string()),
+                name: Some("Apple Inc.".to_string()),
+                instrument_type: Some("EQUITY".to_string()),
+                quote_ccy: Some("USD".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_ne!(updated.asset_id.as_deref(), Some("asset-opt"));
+        assert_eq!(updated.amount, Some(dec!(10)));
+    }
+
+    #[tokio::test]
+    async fn grid_edit_naming_stored_asset_by_pair_keeps_custom_total() {
+        // `BTC-USD` is how the stored `BTC` asset is looked up, so the row keeps
+        // its asset and its custom total.
+        let updated = save_grid_symbol_edit(
+            create_test_asset_with_instrument(
+                "asset-btc",
+                "BTC",
+                None,
+                Some(InstrumentType::Crypto),
+                "USD",
+            ),
+            dec!(12),
+            AssetResolutionInput {
+                id: Some("asset-btc".to_string()),
+                symbol: Some("BTC-USD".to_string()),
+                instrument_type: Some("CRYPTO".to_string()),
+                quote_ccy: Some("USD".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(updated.asset_id.as_deref(), Some("asset-btc"));
+        assert_eq!(updated.amount, Some(dec!(12)));
+        assert!(!updated.needs_review);
+    }
+
+    #[tokio::test]
+    async fn grid_edit_bare_crypto_pair_change_recalculates_custom_total() {
+        let updated = save_grid_symbol_edit(
+            create_test_asset_with_instrument(
+                "asset-btc",
+                "BTC",
+                None,
+                Some(InstrumentType::Crypto),
+                "USD",
+            ),
+            dec!(12),
+            AssetResolutionInput {
+                symbol: Some("BTC-EUR".to_string()),
+                instrument_type: Some("CRYPTO".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_ne!(updated.asset_id.as_deref(), Some("asset-btc"));
+        assert_eq!(updated.amount, Some(dec!(10)));
+        assert!(updated.needs_review);
+    }
+
+    #[tokio::test]
+    async fn grid_edit_between_options_uses_inferred_or_normalized_type() {
+        for instrument_type in [None, Some(" OPTION ")] {
+            let updated = save_grid_symbol_edit(
+                create_test_asset_with_instrument(
+                    "asset-opt",
+                    "AAPL260619C00150000",
+                    None,
+                    Some(InstrumentType::Option),
+                    "USD",
+                ),
+                dec!(1000),
+                AssetResolutionInput {
+                    id: Some("asset-opt".to_string()),
+                    symbol: Some("AAPL260619C00160000".to_string()),
+                    instrument_type: instrument_type.map(str::to_string),
+                    quote_ccy: Some("USD".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            assert_ne!(updated.asset_id.as_deref(), Some("asset-opt"));
+            assert_eq!(updated.amount, Some(dec!(1000)));
+            assert!(!updated.needs_review);
+        }
+    }
+
+    #[tokio::test]
+    async fn grid_edit_bond_alias_keeps_custom_total() {
+        let updated = save_grid_symbol_edit(
+            create_test_asset_with_instrument(
+                "asset-bond",
+                "US037833EZ91",
+                None,
+                Some(InstrumentType::Bond),
+                "USD",
+            ),
+            dec!(12),
+            AssetResolutionInput {
+                id: Some("asset-bond".to_string()),
+                symbol: Some("037833EZ9".to_string()),
+                instrument_type: Some("BOND".to_string()),
+                quote_ccy: Some("USD".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(updated.asset_id.as_deref(), Some("asset-bond"));
+        assert_eq!(updated.amount, Some(dec!(12)));
+        assert!(!updated.needs_review);
+    }
+
+    #[tokio::test]
+    async fn grid_edit_legacy_option_alias_keeps_custom_total() {
+        let mut stored_asset = create_test_asset_with_instrument(
+            "legacy-option",
+            "AAPL260619C00150000",
+            None,
+            Some(InstrumentType::Equity),
+            "USD",
+        );
+        stored_asset.instrument_key = Some("EQUITY:AAPL260619C00150000".to_string());
+        let updated = save_grid_symbol_edit(
+            stored_asset,
+            dec!(12),
+            AssetResolutionInput {
+                id: Some("legacy-option".to_string()),
+                symbol: Some("AAPL  260619C00150000".to_string()),
+                instrument_type: Some("OPTION".to_string()),
+                quote_ccy: Some("USD".to_string()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(updated.asset_id.as_deref(), Some("legacy-option"));
+        assert_eq!(updated.amount, Some(dec!(12)));
+        assert!(!updated.needs_review);
+    }
+
+    #[tokio::test]
+    async fn grid_edit_option_replacement_uses_existing_multiplier_before_creation_seed() {
+        for (include_id, replacement_multiplier, expected_amount) in [
+            (true, None, dec!(100)),
+            (true, Some(dec!(20)), dec!(200)),
+            (false, None, dec!(100)),
+            (false, Some(dec!(100)), dec!(1000)),
+        ] {
+            let mut stored_asset = create_test_asset_with_instrument(
+                "stored-option",
+                "AAPL260619C00150000",
+                None,
+                Some(InstrumentType::Option),
+                "USD",
+            );
+            stored_asset.metadata =
+                crate::assets::build_option_metadata("AAPL260619C00150000", dec!(50));
+            let mut assets = vec![stored_asset];
+            if let Some(multiplier) = replacement_multiplier {
+                let mut replacement = create_test_asset_with_instrument(
+                    "replacement-option",
+                    "AAPL260619C00160000",
+                    None,
+                    Some(InstrumentType::Option),
+                    "USD",
+                );
+                replacement.metadata =
+                    crate::assets::build_option_metadata("AAPL260619C00160000", multiplier);
+                assets.push(replacement);
+            }
+            let mut existing =
+                create_stored_activity("mini-option-row", "acc-final", Some("stored-option"));
+            existing.quantity = Some(dec!(1));
+            existing.unit_price = Some(dec!(10));
+            existing.fee = Some(dec!(0));
+            existing.amount = Some(dec!(500));
+            let service = final_total_service("USD", assets, Some(existing));
+            let mut update = create_test_activity_update(
+                "mini-option-row",
+                "acc-final",
+                Some(AssetResolutionInput {
+                    id: include_id.then(|| "stored-option".to_string()),
+                    symbol: Some("AAPL260619C00160000".to_string()),
+                    instrument_type: Some("OPTION".to_string()),
+                    quote_ccy: Some("USD".to_string()),
+                    ..Default::default()
+                }),
+                "USD",
+            );
+            update.unit_price = Some(Some(dec!(10)));
+            update.amount = None;
+            update.metadata = Some(r#"{"contract_multiplier": 10}"#.to_string());
+
+            let updated = service.update_activity(update).await.expect("option edit");
+            assert_ne!(updated.asset_id.as_deref(), Some("stored-option"));
+            assert_eq!(updated.amount, Some(expected_amount));
+            if replacement_multiplier.is_some() {
+                assert_eq!(updated.asset_id.as_deref(), Some("replacement-option"));
+            }
+            assert!(!updated.needs_review);
+        }
     }
 
     #[tokio::test]
@@ -5467,6 +5795,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         }
     }
 
@@ -9512,6 +9842,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -9590,6 +9922,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -9667,6 +10001,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -9735,6 +10071,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -9810,6 +10148,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -9885,6 +10225,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -9970,6 +10312,8 @@ pub(crate) mod tests {
                 is_external: None,
                 source_group_id: None,
                 charges: None,
+                source_record_id: None,
+                metadata: None,
             }])
             .await
             .expect("import check should succeed");
@@ -10072,6 +10416,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -10170,6 +10516,8 @@ pub(crate) mod tests {
                 is_external: None,
                 source_group_id: None,
                 charges: None,
+                source_record_id: None,
+                metadata: None,
             },
             ActivityImport {
                 id: None,
@@ -10207,6 +10555,8 @@ pub(crate) mod tests {
                 is_external: None,
                 source_group_id: None,
                 charges: None,
+                source_record_id: None,
+                metadata: None,
             },
         ];
 
@@ -10292,6 +10642,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
         let mut tsx = nyse.clone();
         tsx.exchange_mic = Some("XTSE".to_string());
@@ -10364,6 +10716,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
         let mut second = first.clone();
         second.provider_symbol = Some("XAU-OZ".to_string());
@@ -10614,6 +10968,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -10690,6 +11046,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -10759,6 +11117,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -10835,6 +11195,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -10908,6 +11270,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -10978,6 +11342,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11054,6 +11420,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11067,6 +11435,155 @@ pub(crate) mod tests {
         assert!(checked.errors.is_none());
         assert_eq!(checked.exchange_mic, None);
         assert_eq!(checked.quote_mode.as_deref(), Some("MANUAL"));
+    }
+
+    fn no_exchange_service() -> ActivityService {
+        let account_service = Arc::new(MockAccountService::new());
+        account_service.add_account(create_test_account("acc-1", "INR"));
+        ActivityService::new(
+            Arc::new(MockActivityRepository::new()),
+            account_service,
+            Arc::new(MockAssetService::new()),
+            Arc::new(MockFxService::new()),
+            Arc::new(MockQuoteService),
+        )
+    }
+
+    fn no_exchange_fund_import(symbol: &str, provider_id: Option<&str>) -> ActivityImport {
+        ActivityImport {
+            id: None,
+            date: "2026-10-01".to_string(),
+            symbol: symbol.to_string(),
+            activity_type: "BUY".to_string(),
+            quantity: Some(dec!(10)),
+            unit_price: Some(dec!(130)),
+            currency: "INR".to_string(),
+            fee: None,
+            tax: None,
+            amount: Some(dec!(1300)),
+            comment: None,
+            account_id: Some("acc-1".to_string()),
+            account_name: None,
+            symbol_name: None,
+            exchange_mic: None,
+            quote_ccy: Some("INR".to_string()),
+            instrument_type: Some("MUTUALFUND".to_string()),
+            errors: None,
+            warnings: None,
+            duplicate_of_id: None,
+            duplicate_of_line_number: None,
+            is_draft: false,
+            is_valid: true,
+            line_number: Some(1),
+            fx_rate: None,
+            subtype: None,
+            quote_mode: None,
+            provider_id: provider_id.map(str::to_string),
+            provider_symbol: provider_id.map(|_| symbol.to_string()),
+            asset_id: None,
+            isin: None,
+            force_import: false,
+            is_external: None,
+            source_group_id: None,
+            charges: None,
+            source_record_id: None,
+            metadata: None,
+        }
+    }
+
+    fn no_exchange_fund_candidate(symbol: &str, provider_id: Option<&str>) -> ImportAssetCandidate {
+        ImportAssetCandidate {
+            key: symbol.to_string(),
+            account_id: "acc-1".to_string(),
+            symbol: symbol.to_string(),
+            currency: Some("INR".to_string()),
+            instrument_type: Some("MUTUALFUND".to_string()),
+            quote_ccy: Some("INR".to_string()),
+            quote_mode: None,
+            exchange_mic: None,
+            isin: None,
+            provider_id: provider_id.map(str::to_string),
+            provider_symbol: provider_id.map(|_| symbol.to_string()),
+        }
+    }
+
+    /// #2461: AMFI prices a fund by scheme code, without an exchange. A new
+    /// fund the resolver reports as needing no exchange passes the check.
+    #[tokio::test]
+    async fn test_check_import_accepts_new_amfi_fund_without_exchange() {
+        let service = no_exchange_service();
+        for (symbol, provider_id) in [("120505", None), ("120505", Some("AMFI"))] {
+            let result = service
+                .check_activities_import(vec![no_exchange_fund_import(symbol, provider_id)])
+                .await
+                .expect("import check should succeed");
+
+            let checked = &result[0];
+            assert!(
+                checked.is_valid,
+                "{symbol} {provider_id:?}: {:?}",
+                checked.errors
+            );
+            assert!(checked.errors.is_none(), "{symbol} {provider_id:?}");
+            assert_eq!(checked.exchange_mic, None);
+            assert!(checked
+                .provider_id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case("AMFI")));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_import_rejects_new_equity_without_exchange_or_amfi() {
+        let service = no_exchange_service();
+        for (symbol, provider_id) in [
+            ("UNLISTED", None),
+            ("UNLISTED", Some("YAHOO")),
+            ("UNLISTED", Some("METAL_PRICE_API")),
+            ("UNLISTED", Some("custom-scraper")),
+            // Naming AMFI isn't enough; the resolver must resolve it without an exchange.
+            ("UNLISTED", Some("AMFI")),
+        ] {
+            let result = service
+                .check_activities_import(vec![no_exchange_fund_import(symbol, provider_id)])
+                .await
+                .expect("import check should succeed");
+
+            let checked = &result[0];
+            assert!(!checked.is_valid, "{provider_id:?}");
+            assert!(checked
+                .errors
+                .as_ref()
+                .is_some_and(|errors| errors.contains_key("symbol")));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preview_import_assets_accepts_new_amfi_fund_without_exchange() {
+        let service = no_exchange_service();
+        let preview = service
+            .preview_import_assets(vec![no_exchange_fund_candidate("120505", None)])
+            .await
+            .expect("preview should succeed");
+
+        assert_eq!(
+            preview[0].status,
+            ImportAssetPreviewStatus::AutoResolvedNewAsset
+        );
+        assert_eq!(preview[0].resolution_source, "provider_resolution");
+        assert!(preview[0].errors.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_preview_import_assets_flags_new_equity_without_exchange_or_amfi() {
+        let service = no_exchange_service();
+        let preview = service
+            .preview_import_assets(vec![no_exchange_fund_candidate("UNLISTED", None)])
+            .await
+            .expect("preview should succeed");
+
+        assert_eq!(preview[0].status, ImportAssetPreviewStatus::NeedsFixing);
+        assert_eq!(preview[0].resolution_source, "missing_exchange");
     }
 
     #[tokio::test]
@@ -11138,6 +11655,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11212,6 +11731,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11282,6 +11803,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11403,6 +11926,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11475,6 +12000,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11547,6 +12074,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11619,6 +12148,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11688,6 +12219,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11758,6 +12291,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11830,6 +12365,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11911,6 +12448,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -11987,6 +12526,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -12072,6 +12613,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -12149,6 +12692,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -12222,6 +12767,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -12303,6 +12850,8 @@ pub(crate) mod tests {
             is_external: Some(true),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let transfer_in = ActivityImport {
@@ -12341,6 +12890,8 @@ pub(crate) mod tests {
             is_external: Some(true),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -12450,6 +13001,8 @@ pub(crate) mod tests {
             is_external: Some(true),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let transfer_in = ActivityImport {
@@ -12488,6 +13041,8 @@ pub(crate) mod tests {
             is_external: Some(true),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -12576,6 +13131,8 @@ pub(crate) mod tests {
             is_external: Some(false),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let transfer_out = ActivityImport {
@@ -12614,6 +13171,8 @@ pub(crate) mod tests {
             is_external: Some(false),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -12738,6 +13297,8 @@ pub(crate) mod tests {
             is_external: Some(false),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -12873,6 +13434,8 @@ pub(crate) mod tests {
             is_external: Some(true),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let transfer_in_duplicate = ActivityImport {
@@ -12911,6 +13474,8 @@ pub(crate) mod tests {
             is_external: Some(true),
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -15607,6 +16172,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
         (activity_service, activity_repository, import)
     }
@@ -15860,6 +16427,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -15937,6 +16506,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -16078,6 +16649,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -16172,6 +16745,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         // First row: normal import. Second row: identical but force_import=true.
@@ -16273,6 +16848,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -16654,6 +17231,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -16725,6 +17304,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -16796,6 +17377,8 @@ pub(crate) mod tests {
                 is_external: None,
                 source_group_id: None,
                 charges: None,
+                source_record_id: None,
+                metadata: None,
             };
 
             let result = activity_service
@@ -16879,6 +17462,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -16963,6 +17548,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -17035,6 +17622,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -17116,6 +17705,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         };
 
         let result = activity_service
@@ -17789,6 +18380,8 @@ pub(crate) mod tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         }
     }
 
@@ -18208,6 +18801,192 @@ pub(crate) mod tests {
                 .count(),
             1
         );
+    }
+
+    fn qa_msft_buy_row_with_source_id(source_record_id: &str) -> ActivityImport {
+        let mut row = qa_msft_buy_row();
+        row.source_record_id = Some(source_record_id.to_string());
+        row
+    }
+
+    fn rename_stored_activities(repository: &MockActivityRepository, ids: &[&str]) {
+        let mut stored = repository.activities.lock().unwrap();
+        assert_eq!(stored.len(), ids.len());
+        for (activity, id) in stored.iter_mut().zip(ids) {
+            activity.id = id.to_string();
+        }
+    }
+
+    // Two transactions with the same values import as two activities when
+    // their source gives them different IDs, and a later import of each
+    // matches it by ID, even with other values or comment.
+    #[tokio::test]
+    async fn rows_with_source_record_ids_match_by_id_not_values() {
+        let (service, repository, _) = qa_import_service("USD", Vec::new());
+        let mut rows = vec![
+            qa_msft_buy_row_with_source_id("folio-1/7"),
+            qa_msft_buy_row_with_source_id("folio-2/7"),
+        ];
+        rows[1].line_number = Some(2);
+
+        let checked = service.check_activities_import(rows.clone()).await.unwrap();
+        assert!(checked
+            .iter()
+            .all(|row| row.duplicate_of_id.is_none() && row.duplicate_of_line_number.is_none()));
+        let first = service.import_activities(rows.clone()).await.unwrap();
+        assert_eq!(first.summary.imported, 2);
+        rename_stored_activities(&repository, &["stored-1", "stored-2"]);
+        let stored = repository.get_activities().unwrap();
+        assert_eq!(stored[0].source_record_id.as_deref(), Some("folio-1/7"));
+        assert_eq!(stored[1].source_record_id.as_deref(), Some("folio-2/7"));
+        assert!(stored
+            .iter()
+            .all(|activity| activity.source_system.as_deref() == Some("CSV")));
+
+        let mut again = vec![rows[1].clone(), rows[0].clone()];
+        again[0].source_record_id = Some(" folio-2/7 ".to_string());
+        again[1].comment = Some("Reworded".to_string());
+        again[1].quantity = Some(dec!(3));
+        again[1].amount = Some(dec!(1200));
+        let checked = service
+            .check_activities_import(again.clone())
+            .await
+            .unwrap();
+        assert_eq!(checked[0].duplicate_of_id.as_deref(), Some("stored-2"));
+        assert_eq!(checked[1].duplicate_of_id.as_deref(), Some("stored-1"));
+        for rows in [again, checked] {
+            let result = service.import_activities(rows).await.unwrap();
+            assert_eq!(result.summary.imported, 0);
+            assert_eq!(result.summary.duplicates, 2);
+        }
+        assert_eq!(repository.get_activities().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_source_record_id_is_a_duplicate_within_the_batch() {
+        let (service, repository, _) = qa_import_service("USD", Vec::new());
+        let first = qa_msft_buy_row_with_source_id("r-1");
+        let mut repeat = qa_msft_buy_row_with_source_id("r-1");
+        repeat.line_number = Some(2);
+        repeat.date = "2024-05-03".to_string();
+
+        let checked = service
+            .check_activities_import(vec![first.clone(), repeat.clone()])
+            .await
+            .unwrap();
+        assert!(checked[0].duplicate_of_line_number.is_none());
+        assert_eq!(checked[1].duplicate_of_line_number, Some(1));
+        let result = service
+            .import_activities(vec![first, repeat])
+            .await
+            .unwrap();
+        assert_eq!(result.summary.imported, 1);
+        assert_eq!(result.summary.duplicates, 1);
+        assert_eq!(repository.get_activities().unwrap().len(), 1);
+    }
+
+    // An activity imported before its source sent IDs has none and is keyed
+    // by its values. The same row with an ID finds it by those values, also
+    // under the other asset key form; a forced copy keeps its ID's key and is
+    // found by it from then on.
+    #[tokio::test]
+    async fn a_row_with_a_source_record_id_finds_its_import_without_one() {
+        let (service, repository, _) = qa_import_service("USD", Vec::new());
+        service
+            .import_activities(vec![qa_msft_buy_row()])
+            .await
+            .unwrap();
+        rename_stored_activities(&repository, &["imported-without-id"]);
+
+        let row = qa_msft_buy_row_with_source_id("r-1");
+        let checked = service
+            .check_activities_import(vec![row.clone()])
+            .await
+            .unwrap();
+        assert!(checked[0].asset_id.is_some());
+        assert_eq!(
+            checked[0].duplicate_of_id.as_deref(),
+            Some("imported-without-id")
+        );
+        for rows in [vec![row.clone()], checked.clone()] {
+            let result = service.import_activities(rows).await.unwrap();
+            assert_eq!(result.summary.imported, 0);
+            assert_eq!(result.summary.duplicates, 1);
+            assert_eq!(
+                result.activities[0].duplicate_of_id.as_deref(),
+                Some("imported-without-id")
+            );
+        }
+
+        let mut forced = checked[0].clone();
+        forced.force_import = true;
+        let result = service.import_activities(vec![forced]).await.unwrap();
+        assert_eq!(result.summary.imported, 1);
+        rename_stored_activities(&repository, &["imported-without-id", "forced"]);
+        let checked = service.check_activities_import(vec![row]).await.unwrap();
+        assert_eq!(checked[0].duplicate_of_id.as_deref(), Some("forced"));
+    }
+
+    #[tokio::test]
+    async fn forced_source_record_copies_keep_only_a_free_key() {
+        for first_forced in [false, true] {
+            for same_values in [false, true] {
+                let (service, repository, _) = qa_import_service("USD", Vec::new());
+                service
+                    .import_activities(vec![qa_msft_buy_row()])
+                    .await
+                    .unwrap();
+                rename_stored_activities(&repository, &["legacy"]);
+
+                let mut first = qa_msft_buy_row_with_source_id("r-1");
+                first.force_import = first_forced;
+                let mut forced = first.clone();
+                forced.force_import = true;
+                forced.line_number = Some(2);
+                if !same_values {
+                    forced.comment = Some("Reworded".to_string());
+                }
+                let mut another_forced = forced.clone();
+                another_forced.line_number = Some(3);
+                let checked = service
+                    .check_activities_import(vec![first, forced, another_forced])
+                    .await
+                    .unwrap();
+                let result = service.import_activities(checked).await.unwrap();
+                assert_eq!(result.summary.imported, if first_forced { 3 } else { 2 });
+                let stored = repository.get_activities().unwrap();
+                let key = crate::activities::compute_source_record_idempotency_key("qa-acc", "r-1");
+                assert_eq!(
+                    stored
+                        .iter()
+                        .filter(|row| row.idempotency_key.as_deref() == Some(&key))
+                        .count(),
+                    1,
+                    "first_forced={first_forced}, same_values={same_values}"
+                );
+                assert_eq!(stored[1].idempotency_key.as_deref(), Some(key.as_str()));
+
+                let mut again = qa_msft_buy_row_with_source_id("r-1");
+                again.comment = Some("Changed again".to_string());
+                let result = service
+                    .import_activities(vec![again.clone()])
+                    .await
+                    .unwrap();
+                assert_eq!(result.summary.imported, 0);
+                assert_eq!(result.summary.duplicates, 1);
+
+                again.force_import = true;
+                let result = service
+                    .import_activities(vec![again.clone(), again])
+                    .await
+                    .unwrap();
+                assert_eq!(result.summary.imported, 2);
+                let stored = repository.get_activities().unwrap();
+                assert!(stored[stored.len() - 2..]
+                    .iter()
+                    .all(|row| row.idempotency_key.is_none()));
+            }
+        }
     }
 
     #[tokio::test]
@@ -20301,6 +21080,7 @@ pub(crate) mod tests {
                 row("CONVERSION_IN", "fund-b", Some("g-lone")),
                 row("CONVERSION_OUT", "fund-a", Some("g-ab")),
                 row("CONVERSION_IN", "fund-b", Some("g-ab")),
+                row("CONVERSION_OUT", "fund-a", None),
             ])
             .await
             .unwrap();
@@ -20309,13 +21089,440 @@ pub(crate) mod tests {
                 errors
                     .values()
                     .flatten()
-                    .any(|message| message.contains("two rows"))
+                    .any(|message| message.contains("written as a pair"))
             })
         };
         assert!(flagged(&checked[0]) && !checked[0].is_valid);
         assert!(flagged(&checked[1]));
         assert!(!flagged(&checked[2]), "{:?}", checked[2].errors);
         assert!(!flagged(&checked[3]), "{:?}", checked[3].errors);
+        assert!(flagged(&checked[4]) && !checked[4].is_valid);
+    }
+
+    /// A conversion row of an import, for the import check (issue #2452).
+    fn conversion_import(subtype: &str, asset: &str, account: &str, group: &str) -> ActivityImport {
+        serde_json::from_value(json!({
+            "date": "2026-02-03", "symbol": asset, "assetId": asset, "quoteCcy": "USD",
+            "activityType": "ADJUSTMENT", "subtype": subtype, "quantity": "5",
+            "currency": "USD", "accountId": account, "sourceGroupId": group,
+            "isDraft": false, "isValid": true
+        }))
+        .unwrap()
+    }
+
+    fn refused_as_pair(row: &ActivityImport) -> bool {
+        row.errors.as_ref().is_some_and(|errors| {
+            errors
+                .values()
+                .flatten()
+                .any(|message| message.contains("written as a pair"))
+        })
+    }
+
+    fn flagged_conversion(row: &ActivityImport) -> bool {
+        row.errors.as_ref().is_some_and(|errors| {
+            errors
+                .values()
+                .flatten()
+                .any(|message| message.contains("conversion"))
+        })
+    }
+
+    /// The import check refuses what the import refuses: a conversion whose
+    /// group already has rows, in another account too, is flagged on its rows,
+    /// and the rest of the file then imports.
+    #[tokio::test]
+    async fn the_import_check_flags_a_conversion_joining_a_stored_group() {
+        for repeated in [false, true] {
+            let (service, repository) = conversion_fixture();
+            // Stores "out" and "in" in acc-1, group "conv-1".
+            create_conversion(&service).await;
+            let mut rows = vec![
+                conversion_import("CONVERSION_OUT", "fund-a", "acc-2", "conv-1"),
+                conversion_import("CONVERSION_IN", "fund-b", "acc-2", "conv-1"),
+            ];
+            if repeated {
+                rows.extend_from_within(..);
+            }
+            let refused_count = rows.len();
+            rows.extend([
+                conversion_import("CONVERSION_OUT", "fund-a", "acc-2", "g-new"),
+                conversion_import("CONVERSION_IN", "fund-c", "acc-2", "g-new"),
+            ]);
+            let checked = service.check_activities_import(rows).await.unwrap();
+            assert!(
+                checked[..refused_count]
+                    .iter()
+                    .all(|row| refused_as_pair(row) && !row.is_valid),
+                "{checked:?}"
+            );
+            assert!(
+                checked[refused_count..]
+                    .iter()
+                    .all(|row| row.is_valid && !flagged_conversion(row)),
+                "{checked:?}"
+            );
+
+            let kept: Vec<ActivityImport> =
+                checked.into_iter().filter(|row| row.is_valid).collect();
+            let result = service.import_activities(kept).await.unwrap();
+            assert!(result.summary.success, "{:?}", result.activities);
+            assert_eq!(result.summary.imported, 2);
+            assert_eq!(repository.get_activities().unwrap().len(), 4);
+        }
+    }
+
+    /// Unresolved listings keep their exchange identity without creating assets
+    /// during the check, including when the other asset is already resolved.
+    #[tokio::test]
+    async fn the_import_check_tells_new_assets_apart_by_exchange() {
+        for (leaving_mic, arriving_mic, resolved_leaving) in [
+            (Some("XNYS"), Some("XNAS"), false),
+            (Some(" xnys "), Some("xnas"), false),
+            (None, Some("XNAS"), false),
+            (Some("XNYS"), None, false),
+            (Some("XNYS"), Some("XNAS"), true),
+        ] {
+            let accounts = Arc::new(MockAccountService::new());
+            accounts.add_account(create_test_account("acc-1", "USD"));
+            let assets = Arc::new(MockAssetService::new());
+            if resolved_leaving {
+                assets.add_asset(create_test_asset_with_instrument(
+                    "existing-acme",
+                    "ACME",
+                    leaving_mic,
+                    Some(InstrumentType::Equity),
+                    "USD",
+                ));
+            }
+            let repository = Arc::new(MockActivityRepository::new());
+            let fx = Arc::new(MockFxService::new());
+            let service = ActivityService::new(
+                repository.clone(),
+                accounts,
+                assets.clone(),
+                fx.clone(),
+                Arc::new(MockQuoteService),
+            );
+            let mut rows: Vec<ActivityImport> = [
+                ("CONVERSION_OUT", leaving_mic),
+                ("CONVERSION_IN", arriving_mic),
+            ]
+            .into_iter()
+            .map(|(subtype, mic)| {
+                let mut row = conversion_import(subtype, "ACME", "acc-1", "g-venues");
+                row.asset_id = None;
+                row.exchange_mic = mic.map(str::to_string);
+                row.instrument_type = Some("EQUITY".into());
+                row.quote_mode = Some("MANUAL".into());
+                row
+            })
+            .collect();
+            if resolved_leaving {
+                rows[0].asset_id = Some("existing-acme".into());
+            }
+
+            let checked = service.check_activities_import(rows).await.unwrap();
+            assert!(
+                checked
+                    .iter()
+                    .all(|row| row.is_valid && !flagged_conversion(row)),
+                "{checked:?}"
+            );
+            assert_eq!(
+                assets.get_assets().unwrap().len(),
+                usize::from(resolved_leaving)
+            );
+            assert!(repository.get_activities().unwrap().is_empty());
+            assert!(fx.get_registered_pairs().is_empty());
+
+            let result = service.import_activities(checked).await.unwrap();
+            assert!(result.summary.success, "{:?}", result.activities);
+            assert_eq!(result.summary.imported, 2);
+            assert_eq!(
+                result.summary.assets_created,
+                if resolved_leaving { 1 } else { 2 }
+            );
+            let stored = repository.get_activities().unwrap();
+            assert_ne!(stored[0].asset_id, stored[1].asset_id);
+        }
+    }
+
+    /// Equivalent MIC spellings and an absent or blank MIC still name one listing.
+    #[tokio::test]
+    async fn the_import_check_keeps_equivalent_exchange_names_together() {
+        let accounts = Arc::new(MockAccountService::new());
+        accounts.add_account(create_test_account("acc-1", "USD"));
+        let assets = Arc::new(MockAssetService::new());
+        let repository = Arc::new(MockActivityRepository::new());
+        let fx = Arc::new(MockFxService::new());
+        let service = ActivityService::new(
+            repository.clone(),
+            accounts,
+            assets.clone(),
+            fx.clone(),
+            Arc::new(MockQuoteService),
+        );
+        for (leaving_mic, arriving_mic) in [
+            (Some("XNYS"), Some("XNYS")),
+            (Some("XNYS"), Some(" xnys ")),
+            (Some("CXE"), Some("BCXE")),
+            (None, None),
+            (None, Some("")),
+            (None, Some(" \t ")),
+            (Some(""), Some(" \t ")),
+        ] {
+            let rows = [
+                ("CONVERSION_OUT", leaving_mic),
+                ("CONVERSION_IN", arriving_mic),
+            ]
+            .into_iter()
+            .map(|(subtype, mic)| {
+                let mut row = conversion_import(subtype, "ACME", "acc-1", "g-one-venue");
+                row.asset_id = None;
+                row.exchange_mic = mic.map(str::to_string);
+                row.instrument_type = Some("EQUITY".into());
+                row.quote_mode = Some("MANUAL".into());
+                row
+            })
+            .collect();
+            let checked = service.check_activities_import(rows).await.unwrap();
+            assert!(checked.iter().all(refused_as_pair), "{checked:?}");
+        }
+        assert!(assets.get_assets().unwrap().is_empty());
+        assert!(repository.get_activities().unwrap().is_empty());
+        assert!(fx.get_registered_pairs().is_empty());
+    }
+
+    /// A stored draft is a row of its group too.
+    #[tokio::test]
+    async fn the_import_check_counts_a_stored_draft_in_a_conversion_group() {
+        let (service, _) = conversion_fixture();
+        let draft = |id: &str, subtype: &str, asset: &str| {
+            let mut row = conversion_row(id, subtype, asset, dec!(5));
+            row.source_group_id = Some("g-draft".into());
+            row.status = Some(ActivityStatus::Draft);
+            row
+        };
+        let created = service
+            .bulk_mutate_activities(ActivityBulkMutationRequest {
+                creates: vec![
+                    draft("out", "CONVERSION_OUT", "fund-a"),
+                    draft("in", "CONVERSION_IN", "fund-b"),
+                ],
+                updates: vec![],
+                delete_ids: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(created.errors.is_empty(), "{:?}", created.errors);
+
+        let checked = service
+            .check_activities_import(vec![
+                conversion_import("CONVERSION_OUT", "fund-a", "acc-2", "g-draft"),
+                conversion_import("CONVERSION_IN", "fund-b", "acc-2", "g-draft"),
+            ])
+            .await
+            .unwrap();
+        assert!(checked.iter().all(refused_as_pair), "{checked:?}");
+    }
+
+    /// Re-imported rows are duplicates the import skips, so their stored
+    /// group is no refusal; forced, they would join it and are refused.
+    #[tokio::test]
+    async fn the_import_check_follows_the_import_on_a_reimported_conversion() {
+        let (service, repository) = conversion_fixture();
+        let rows = vec![
+            conversion_import("CONVERSION_OUT", "fund-a", "acc-1", "g-1"),
+            conversion_import("CONVERSION_IN", "fund-b", "acc-1", "g-1"),
+        ];
+        let first = service.import_activities(rows.clone()).await.unwrap();
+        assert_eq!(first.summary.imported, 2, "{:?}", first.activities);
+
+        let checked = service.check_activities_import(rows.clone()).await.unwrap();
+        assert!(
+            checked
+                .iter()
+                .all(|row| row.is_valid && row.duplicate_of_id.is_some()),
+            "{checked:?}"
+        );
+
+        let forced: Vec<ActivityImport> = rows
+            .into_iter()
+            .map(|mut row| {
+                row.force_import = true;
+                row
+            })
+            .collect();
+        let checked = service
+            .check_activities_import(forced.clone())
+            .await
+            .unwrap();
+        assert!(checked.iter().all(refused_as_pair), "{checked:?}");
+        let result = service.import_activities(forced).await.unwrap();
+        assert!(!result.summary.success);
+        assert_eq!(repository.get_activities().unwrap().len(), 2);
+    }
+
+    /// A conversion repeated in one file imports once: the check leaves the
+    /// repeat to the import's duplicate rule rather than flagging the group.
+    #[tokio::test]
+    async fn the_import_check_leaves_a_conversion_repeated_in_the_file() {
+        let (service, repository) = conversion_fixture();
+        let pair = [
+            conversion_import("CONVERSION_OUT", "fund-a", "acc-1", "g-1"),
+            conversion_import("CONVERSION_IN", "fund-b", "acc-1", "g-1"),
+        ];
+        let rows: Vec<ActivityImport> = pair.iter().chain(pair.iter()).cloned().collect();
+        let checked = service.check_activities_import(rows).await.unwrap();
+        assert!(
+            !checked.iter().any(flagged_conversion),
+            "{:?}",
+            checked.iter().map(|row| &row.errors).collect::<Vec<_>>()
+        );
+        assert!(checked[2].duplicate_of_line_number.is_some());
+
+        let result = service.import_activities(checked).await.unwrap();
+        assert!(result.summary.success, "{:?}", result.activities);
+        assert_eq!(result.summary.imported, 2);
+        assert_eq!(result.summary.duplicates, 2);
+        assert_eq!(repository.get_activities().unwrap().len(), 2);
+    }
+
+    /// A file can repair a stored lone row with just its missing counterpart,
+    /// or with both rows: the stored one is skipped as a duplicate.
+    #[tokio::test]
+    async fn the_import_check_allows_a_new_row_to_repair_a_stored_conversion() {
+        for include_duplicate in [true, false] {
+            let (service, repository) = conversion_fixture();
+            let mut stored = create_stored_activity("legacy-out", "acc-1", Some("fund-a"));
+            stored.activity_type = "ADJUSTMENT".into();
+            stored.subtype = Some("CONVERSION_OUT".into());
+            stored.source_group_id = Some("g-repair".into());
+            stored.activity_date = parse_test_activity_datetime("2026-02-03");
+            stored.quantity = Some(dec!(5));
+            stored.unit_price = None;
+            stored.amount = None;
+            stored.idempotency_key =
+                Some(crate::activities::compute_activity_idempotency_key(&stored));
+            repository.add_activity(stored);
+
+            let mut rows = vec![conversion_import(
+                "CONVERSION_IN",
+                "fund-b",
+                "acc-1",
+                "g-repair",
+            )];
+            if include_duplicate {
+                rows.insert(
+                    0,
+                    conversion_import("CONVERSION_OUT", "fund-a", "acc-1", "g-repair"),
+                );
+            }
+            let checked = service.check_activities_import(rows).await.unwrap();
+            if include_duplicate {
+                assert_eq!(checked[0].duplicate_of_id.as_deref(), Some("legacy-out"));
+            }
+            assert!(
+                checked
+                    .iter()
+                    .all(|row| row.is_valid && !flagged_conversion(row)),
+                "{checked:?}"
+            );
+            let result = service.import_activities(checked).await.unwrap();
+            assert!(result.summary.success, "{:?}", result.activities);
+            assert_eq!(result.summary.imported, 1);
+            assert_eq!(result.summary.duplicates, u32::from(include_duplicate));
+            assert_eq!(repository.get_activities().unwrap().len(), 2);
+        }
+    }
+
+    /// A duplicate marker left by an earlier check is recomputed, not trusted.
+    #[tokio::test]
+    async fn the_import_check_recomputes_stale_conversion_duplicate_markers() {
+        for stored_marker in [false, true] {
+            let (service, repository) = conversion_fixture();
+            let mut row = conversion_import("CONVERSION_OUT", "fund-a", "acc-1", "g-lone");
+            if stored_marker {
+                row.duplicate_of_id = Some("no-longer-a-duplicate".into());
+            } else {
+                row.duplicate_of_line_number = Some(1);
+            }
+            let checked = service
+                .check_activities_import(vec![row.clone()])
+                .await
+                .unwrap();
+            assert!(refused_as_pair(&checked[0]), "{checked:?}");
+            assert!(checked[0].duplicate_of_id.is_none());
+            assert!(checked[0].duplicate_of_line_number.is_none());
+
+            let result = service.import_activities(vec![row]).await.unwrap();
+            assert!(!result.summary.success);
+            assert!(refused_as_pair(&result.activities[0]));
+            assert!(repository.get_activities().unwrap().is_empty());
+        }
+    }
+
+    /// Rows the caller leaves out for other errors are not rows of a
+    /// conversion: their other row is flagged, and a pair they would have
+    /// joined is not.
+    #[tokio::test]
+    async fn the_import_check_pairs_only_conversion_rows_without_other_errors() {
+        for invalid_case in ["missing-account", "unknown-account", "row-error"] {
+            let (service, _) = conversion_fixture();
+            let invalidate = |mut row: ActivityImport| {
+                match invalid_case {
+                    "missing-account" => row.account_id = None,
+                    "unknown-account" => row.account_id = Some("not-an-account".into()),
+                    _ => {
+                        row.is_valid = false;
+                        row.errors = Some(HashMap::from([(
+                            "quantity".into(),
+                            vec!["Unresolved quantity from the review step".into()],
+                        )]));
+                    }
+                }
+                row
+            };
+            let checked = service
+                .check_activities_import(vec![
+                    conversion_import("CONVERSION_OUT", "fund-a", "acc-1", "g-broken"),
+                    invalidate(conversion_import(
+                        "CONVERSION_IN",
+                        "fund-b",
+                        "acc-1",
+                        "g-broken",
+                    )),
+                    conversion_import("CONVERSION_OUT", "fund-a", "acc-1", "g-whole"),
+                    conversion_import("CONVERSION_IN", "fund-b", "acc-1", "g-whole"),
+                    invalidate(conversion_import(
+                        "CONVERSION_OUT",
+                        "fund-c",
+                        "acc-1",
+                        "g-whole",
+                    )),
+                ])
+                .await
+                .unwrap();
+            assert!(refused_as_pair(&checked[0]), "{invalid_case}: {checked:?}");
+            for index in [1, 4] {
+                assert!(checked[index]
+                    .errors
+                    .as_ref()
+                    .is_some_and(|errors| !errors.is_empty()));
+                assert!(
+                    !flagged_conversion(&checked[index]),
+                    "{invalid_case}: {checked:?}"
+                );
+            }
+            for index in [2, 3] {
+                assert!(checked[index].is_valid, "{invalid_case}: {checked:?}");
+                assert!(
+                    !flagged_conversion(&checked[index]),
+                    "{invalid_case}: {checked:?}"
+                );
+            }
+        }
     }
 
     /// An imported conversion the write check refuses fails the import as a

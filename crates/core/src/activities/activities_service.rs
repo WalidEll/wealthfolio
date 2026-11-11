@@ -62,7 +62,8 @@ use crate::activities::charges::{
 };
 use crate::activities::csv_parser::{self, ParseConfig, ParsedCsvResult};
 use crate::activities::idempotency::{
-    compute_activity_idempotency_key, compute_idempotency_key, idempotency_activity_type,
+    compute_activity_idempotency_key, compute_idempotency_key,
+    compute_source_record_idempotency_key, idempotency_activity_type,
 };
 use crate::activities::{
     is_conversion_row, ActivityRepositoryTrait, ActivityServiceTrait, ConversionPair,
@@ -99,7 +100,7 @@ type QuoteCcyCache = HashMap<(String, Option<String>, Option<String>), Option<St
 /// Cache key: (symbol, activity currency, ISIN) → symbol resolution result
 type SymbolResolutionKey = (String, String, Option<String>);
 use uuid::Uuid;
-use wealthfolio_market_data::mic_to_currency;
+use wealthfolio_market_data::{canonicalize_exchange_mic, mic_to_currency};
 
 /// A complete trade is identified by quantity and unit price. Its final cash
 /// amount is derived accounting data and may legitimately change when charges
@@ -662,12 +663,9 @@ impl ActivityService {
         );
     }
 
-    /// Asset facts an update patch needs, fetched at most twice (existing
-    /// asset plus a replacement, when one is named). A replacement asset that
-    /// carries a symbol but no resolved id does not exist yet, so the
-    /// multiplier must come from the patch's instrument facts - falling back
-    /// to the existing asset would price an option or bond edit at the old
-    /// asset's scale.
+    /// Asset facts an update patch needs before preparation. An unresolved
+    /// replacement uses the patch's instrument facts rather than the old
+    /// asset's multiplier.
     fn update_trade_facts(
         &self,
         activity: &ActivityUpdate,
@@ -689,7 +687,63 @@ impl ActivityService {
         };
         let existing_is_crypto = is_crypto_asset(existing_asset.as_ref());
 
-        if let Some(asset_id) = activity.get_symbol_id() {
+        let submitted_instrument_type = Self::parse_instrument_type(activity.get_instrument_type())
+            .or_else(|| {
+                activity.get_symbol_code().and_then(|symbol| {
+                    self.infer_asset_kind(symbol, activity.get_exchange_mic(), activity.get_kind())
+                        .1
+                })
+            });
+        let (normalized_symbol, exchange_mic) = Self::submitted_lookup_identity(
+            activity.get_symbol_code(),
+            activity.get_exchange_mic().map(str::to_string),
+            submitted_instrument_type.as_ref(),
+        );
+        let quote_ccy = Self::normalize_quote_ccy(activity.get_quote_ccy());
+        // Options and bonds are looked up the way prepare resolves them, so an
+        // alias of the stored asset keeps it and an existing replacement is
+        // priced with its own multiplier.
+        let looks_up_existing = matches!(
+            submitted_instrument_type.as_ref(),
+            Some(InstrumentType::Bond | InstrumentType::Option)
+        );
+        let resolved_asset_id = match activity.get_symbol_id() {
+            Some(asset_id)
+                if Some(asset_id) != existing.asset_id.as_deref() || existing_asset.is_none() =>
+            {
+                Some(asset_id.to_string())
+            }
+            None if !looks_up_existing => None,
+            // The stored id (the grid sends it next to a newly picked symbol),
+            // or an option or bond symbol without an id: prepare keeps the
+            // stored asset only while the submitted identity still names it.
+            _ => existing_asset
+                .as_ref()
+                .filter(|asset| {
+                    Self::asset_matches_submitted_identity(
+                        asset,
+                        normalized_symbol.as_deref(),
+                        exchange_mic.as_deref(),
+                        submitted_instrument_type.as_ref(),
+                        quote_ccy.as_deref(),
+                    )
+                })
+                .map(|asset| asset.id.clone())
+                .or_else(|| {
+                    normalized_symbol
+                        .as_deref()
+                        .filter(|_| looks_up_existing)
+                        .and_then(|symbol| {
+                            self.find_existing_asset_id(
+                                symbol,
+                                exchange_mic.as_deref(),
+                                submitted_instrument_type.as_ref(),
+                                quote_ccy.as_deref(),
+                            )
+                        })
+                }),
+        };
+        if let Some(asset_id) = resolved_asset_id.as_deref() {
             if Some(asset_id) == existing.asset_id.as_deref() {
                 return UpdateTradeFacts {
                     unit_multiplier: existing_unit_multiplier,
@@ -732,22 +786,17 @@ impl ActivityService {
                         .is_some_and(|code| code.eq_ignore_ascii_case(symbol))
             });
             if !names_current_asset {
-                let instrument_type = activity.get_instrument_type().unwrap_or_default();
-                let unit_multiplier = crate::assets::instrument_default_multiplier(
-                    instrument_type.eq_ignore_ascii_case("OPTION"),
-                    false,
-                );
-                // Same inference `prepare_update_activity` applies when it
-                // resolves the bare symbol later (e.g. BTC-USD is crypto).
-                let replacement_type =
-                    Self::parse_instrument_type(Some(instrument_type)).or_else(|| {
-                        self.infer_asset_kind(
-                            symbol,
-                            activity.get_exchange_mic(),
-                            activity.get_kind(),
+                let option_metadata = Self::custom_option_multiplier(activity.metadata.as_deref())
+                    .and_then(|multiplier| {
+                        crate::assets::build_option_metadata(
+                            normalized_symbol.as_deref().unwrap_or(symbol),
+                            multiplier,
                         )
-                        .1
                     });
+                let unit_multiplier = crate::assets::contract_multiplier_from_asset_metadata(
+                    submitted_instrument_type.as_ref(),
+                    option_metadata.as_ref(),
+                );
                 // A blank currency is filled from the replacement asset when
                 // the update is prepared; find an existing asset's quote
                 // currency with the same local lookup the save uses.
@@ -761,13 +810,13 @@ impl ActivityService {
                     self.asset_service.existing_quote_ccy_by_symbol(
                         base_symbol,
                         exchange_mic,
-                        replacement_type.as_ref(),
+                        submitted_instrument_type.as_ref(),
                     )
                 });
                 return UpdateTradeFacts {
                     unit_multiplier,
                     existing_unit_multiplier,
-                    is_crypto: replacement_type == Some(InstrumentType::Crypto),
+                    is_crypto: submitted_instrument_type == Some(InstrumentType::Crypto),
                     existing_is_crypto,
                     quote_ccy,
                     replaces_asset: true,
@@ -851,6 +900,86 @@ impl ActivityService {
                 existing.metadata.as_ref(),
                 patch,
             ));
+        }
+
+        let cash_reclassification = matches!(
+            (existing.effective_type(), activity.activity_type.as_str()),
+            (ACTIVITY_TYPE_WITHDRAWAL, ACTIVITY_TYPE_TRANSFER_OUT)
+                | (ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL)
+                | (ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_TRANSFER_IN)
+                | (ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_DEPOSIT)
+        );
+        if cash_reclassification {
+            if Self::non_cash_transfer_asset_key(existing).is_some() {
+                return Err(Self::invalid_activity_data(
+                    "Only cash activities can be reclassified as deposits or withdrawals",
+                ));
+            }
+            if self.is_in_transfer_pair(existing)? {
+                return Err(Self::invalid_activity_data(
+                    "Unlink the transfer pair before changing its activity type",
+                ));
+            }
+            let mut metadata = activity
+                .metadata
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .or_else(|| existing.metadata.clone())
+                .unwrap_or_else(|| serde_json::json!({}));
+            // Preserve other flow facts when reclassification sends a boundary-only patch.
+            if let (Some(stored_flow), Some(flow)) = (
+                existing
+                    .metadata
+                    .as_ref()
+                    .and_then(|value| value.get("flow"))
+                    .and_then(serde_json::Value::as_object),
+                metadata
+                    .get_mut("flow")
+                    .and_then(serde_json::Value::as_object_mut),
+            ) {
+                for (key, value) in stored_flow {
+                    flow.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            let becomes_transfer = matches!(
+                activity.activity_type.as_str(),
+                ACTIVITY_TYPE_TRANSFER_IN | ACTIVITY_TYPE_TRANSFER_OUT
+            );
+            if becomes_transfer && !metadata.is_object() {
+                metadata = serde_json::json!({});
+            }
+            if let Some(object) = metadata.as_object_mut() {
+                if becomes_transfer {
+                    let flow = object
+                        .entry("flow")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if !flow.is_object() {
+                        *flow = serde_json::json!({});
+                    }
+                    if let Some(flow) = flow.as_object_mut() {
+                        // The pair-conversion action supplies false. A simple
+                        // reclassification has no counterpart and defaults external.
+                        if flow
+                            .get("is_external")
+                            .and_then(|value| value.as_bool())
+                            .is_none()
+                        {
+                            flow.insert("is_external".into(), serde_json::json!(true));
+                        }
+                    }
+                } else {
+                    object.remove("transfer");
+                    if let Some(flow) = object.get_mut("flow").and_then(|flow| flow.as_object_mut())
+                    {
+                        flow.remove("is_external");
+                        if flow.is_empty() {
+                            object.remove("flow");
+                        }
+                    }
+                }
+            }
+            activity.metadata = Some(metadata.to_string());
+            activity.subtype = Some(String::new());
         }
 
         if activity
@@ -1863,8 +1992,7 @@ impl ActivityService {
         let Some(group_id) = activity
             .source_group_id
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
         else {
             return Ok(false);
         };
@@ -2559,8 +2687,7 @@ impl ActivityService {
         let Some(group_id) = activity
             .source_group_id
             .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
         else {
             return Ok(None);
         };
@@ -2875,11 +3002,20 @@ impl ActivityService {
                 .clone()
                 .unwrap_or_else(|| format!("new-activity-{index}")),
             account_id: create.account_id.clone(),
-            // An import may name an asset it has not resolved yet.
-            asset_id: create
-                .asset
-                .as_ref()
-                .and_then(|asset| asset.id.clone().or_else(|| asset.symbol.clone())),
+            // An import may name an asset it has not resolved yet: its symbol
+            // and exchange stand for it, as one ticker on two exchanges is two
+            // assets.
+            asset_id: create.asset.as_ref().and_then(|asset| {
+                asset.id.clone().or_else(|| {
+                    let symbol = asset.symbol.as_deref()?;
+                    Some(match asset.exchange_mic.as_deref().map(str::trim) {
+                        Some(mic) if !mic.is_empty() => {
+                            format!("{symbol}@{}", canonicalize_exchange_mic(mic))
+                        }
+                        _ => symbol.to_string(),
+                    })
+                })
+            }),
             activity_type: create.activity_type.clone(),
             activity_type_override: None,
             source_type: None,
@@ -3457,8 +3593,14 @@ impl ActivityService {
         activity: &ActivityImport,
         default_account_id: &str,
     ) -> Option<String> {
-        let date = Self::parse_import_date_for_idempotency(&activity.date)?;
         let account_id = activity.account_id.as_deref().unwrap_or(default_account_id);
+        if let Some(source_record_id) = activity.source_record_id() {
+            return Some(compute_source_record_idempotency_key(
+                account_id,
+                source_record_id,
+            ));
+        }
+        let date = Self::parse_import_date_for_idempotency(&activity.date)?;
 
         // Use UUID when the asset already exists in the DB (set during validation).
         // Falls back to symbol@mic for new assets, matching the apply-step convention.
@@ -3529,6 +3671,7 @@ impl ActivityService {
         existing: &mut HashMap<String, String>,
     ) -> Result<()> {
         let mut keys_by_legacy_key: HashMap<String, HashSet<String>> = HashMap::new();
+        // A row with a source record ID is keyed by it, not by its values.
         for activity in activities {
             if !matches!(
                 activity.activity_type.as_str(),
@@ -3536,6 +3679,7 @@ impl ActivityService {
             ) || activity.amount.is_none()
                 || activity.quantity.is_none()
                 || activity.unit_price.is_none()
+                || activity.source_record_id().is_some()
             {
                 continue;
             }
@@ -3603,6 +3747,10 @@ impl ActivityService {
     ) -> Result<HashMap<usize, String>> {
         let mut rows_by_other_key: HashMap<String, Vec<(usize, &'a str)>> = HashMap::new();
         for (position, activity, asset_id) in activities {
+            // A row with a source record ID is keyed by it, not by its asset.
+            if activity.source_record_id().is_some() {
+                continue;
+            }
             let Some(asset_id) = asset_id.filter(|id| !id.trim().is_empty()) else {
                 continue;
             };
@@ -3665,6 +3813,53 @@ impl ActivityService {
         Ok(duplicates)
     }
 
+    /// The stored activities that rows with a source record ID match by their
+    /// values, by row position. An activity imported before its source sent
+    /// IDs has no ID and is keyed by its values, so a row matches it the way
+    /// the row without its ID would. An activity imported with an ID is keyed
+    /// by the ID, so this never matches it.
+    fn find_duplicates_imported_without_source_ids<'a>(
+        &self,
+        activities: impl Iterator<Item = (usize, &'a ActivityImport, Option<&'a str>)>,
+    ) -> Result<HashMap<usize, String>> {
+        let rows: Vec<(usize, ActivityImport, Option<&str>)> = activities
+            .filter(|(_, activity, _)| activity.source_record_id().is_some())
+            .map(|(position, activity, asset_id)| {
+                let mut row = activity.clone();
+                row.source_record_id = None;
+                (position, row, asset_id)
+            })
+            .collect();
+        let keys: Vec<(usize, String)> = rows
+            .iter()
+            .filter_map(|(position, row, _)| {
+                let account_id = row.account_id.as_deref()?;
+                Some((
+                    *position,
+                    Self::build_import_idempotency_key(row, account_id)?,
+                ))
+            })
+            .collect();
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let unique_keys: HashSet<String> = keys.iter().map(|(_, key)| key.clone()).collect();
+        let mut existing = self.check_existing_duplicates(unique_keys.into_iter().collect())?;
+        self.add_legacy_import_duplicates(rows.iter().map(|(_, row, _)| row), &mut existing)?;
+        let mut duplicates = self.find_other_asset_form_duplicates(
+            rows.iter()
+                .map(|(position, row, asset_id)| (*position, row, *asset_id)),
+            &existing,
+        )?;
+        for (position, key) in keys {
+            if let Some(existing_id) = existing.get(&key) {
+                duplicates.insert(position, existing_id.clone());
+            }
+        }
+        Ok(duplicates)
+    }
+
     fn add_activity_warning(activity: &mut ActivityImport, key: &str, message: &str) {
         let warnings = activity.warnings.get_or_insert_with(HashMap::new);
         let entry = warnings.entry(key.to_string()).or_default();
@@ -3673,54 +3868,70 @@ impl ActivityService {
         }
     }
 
-    /// A conversion is imported as its two rows (rules R7.5). A conversion
-    /// row whose other row is not in the batch is flagged on its row here,
-    /// before the import, which would otherwise refuse the whole batch.
-    fn flag_unpaired_conversion_imports(rows: &mut [ActivityImport]) {
-        let direction = |row: &ActivityImport| {
-            if !row
-                .activity_type
-                .eq_ignore_ascii_case(ACTIVITY_TYPE_ADJUSTMENT)
-            {
-                return None;
-            }
-            NewActivity::canonicalize_subtype(row.subtype.as_deref()).filter(|subtype| {
-                subtype == ACTIVITY_SUBTYPE_CONVERSION_OUT
-                    || subtype == ACTIVITY_SUBTYPE_CONVERSION_IN
+    /// The import's conversion check (rules R7.5), run by the import check on
+    /// the rows the import would insert: valid rows that are not duplicates,
+    /// unless forced. Their conversions are checked with the stored rows of
+    /// their groups, so a conversion the import would refuse, including a
+    /// conversion row whose other row is neither inserted nor stored, is
+    /// flagged on its rows here instead of failing the whole import.
+    fn flag_refused_conversion_imports(&self, rows: &mut [ActivityImport]) -> Result<()> {
+        let inserted: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.is_valid
+                    && row.errors.as_ref().is_none_or(HashMap::is_empty)
+                    && !Self::import_skips_as_duplicate(row)
             })
-        };
-        let group = |row: &ActivityImport| {
-            row.source_group_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|group| !group.is_empty())
-                .map(str::to_string)
-        };
-        let mut directions: HashMap<String, Vec<String>> = HashMap::new();
-        for row in rows.iter() {
-            if let (Some(direction), Some(group)) = (direction(row), group(row)) {
-                directions.entry(group).or_default().push(direction);
-            }
-        }
-        for row in rows.iter_mut() {
-            if direction(row).is_none() {
-                continue;
-            }
-            let paired = group(row)
-                .and_then(|group| directions.get(&group))
-                .is_some_and(|found| {
-                    found.len() == 2
-                        && found.iter().any(|d| d == ACTIVITY_SUBTYPE_CONVERSION_OUT)
-                        && found.iter().any(|d| d == ACTIVITY_SUBTYPE_CONVERSION_IN)
-                });
-            if !paired {
-                Self::add_activity_error(
-                    row,
-                    "general",
-                    "A conversion is imported as its two rows, CONVERSION_OUT and CONVERSION_IN, sharing one sourceGroupId.",
+            .map(|(index, _)| index)
+            .collect();
+        let creates: Vec<NewActivity> = inserted
+            .iter()
+            .map(|&index| {
+                let mut create = NewActivity::from(rows[index].clone());
+                create.subtype = NewActivity::canonicalize_subtype_for_activity(
+                    &create.activity_type,
+                    create.subtype.as_deref(),
                 );
+                Self::normalize_new_activity_economic_signs(&mut create);
+                create
+            })
+            .collect();
+        let mut refused_keys = HashMap::new();
+        for (offset, message) in self.refused_conversion_imports(&creates)? {
+            let row = &mut rows[inserted[offset]];
+            if let Some(key) = Self::build_import_idempotency_key(
+                row,
+                row.account_id.as_deref().unwrap_or_default(),
+            ) {
+                refused_keys.insert(key, message.clone());
+            }
+            Self::add_activity_error(row, "general", &message);
+        }
+        // Removing a refused row makes its batch copies insertable on import.
+        for row in rows.iter_mut().filter(|row| {
+            row.is_valid
+                && row.errors.as_ref().is_none_or(HashMap::is_empty)
+                && row.duplicate_of_line_number.is_some()
+                && row.duplicate_of_id.is_none()
+        }) {
+            if let Some(message) = Self::build_import_idempotency_key(
+                row,
+                row.account_id.as_deref().unwrap_or_default(),
+            )
+            .and_then(|key| refused_keys.get(&key))
+            {
+                Self::add_activity_error(row, "general", message);
             }
         }
+        Ok(())
+    }
+
+    /// Whether the import skips a checked row as a duplicate: one stored or
+    /// earlier in the batch, and not forced.
+    fn import_skips_as_duplicate(row: &ActivityImport) -> bool {
+        !row.force_import
+            && (row.duplicate_of_id.is_some() || row.duplicate_of_line_number.is_some())
     }
 
     fn add_activity_error(activity: &mut ActivityImport, key: &str, message: &str) {
@@ -3967,8 +4178,8 @@ impl ActivityService {
     const METADATA_CONTRACT_MULTIPLIER: &'static str = "contract_multiplier";
 
     /// The creation-time multiplier seed an activity may carry. Read ONLY when
-    /// this row creates its asset; the asset owns the multiplier from then on,
-    /// so nothing downstream consults this.
+    /// this row creates its asset or prices an unresolved replacement; an
+    /// existing asset's own multiplier takes precedence.
     fn custom_option_multiplier(activity_metadata: Option<&str>) -> Option<Decimal> {
         activity_metadata
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
@@ -4212,6 +4423,48 @@ impl ActivityService {
                 true
             }
         }
+    }
+
+    /// The symbol and MIC a submitted asset is looked up by, from the payload
+    /// and a venue suffix only (no live lookup for user save paths): a crypto
+    /// pair keeps its base, an OCC symbol is normalized, and crypto and FX
+    /// take no MIC.
+    fn submitted_lookup_identity(
+        symbol: Option<&str>,
+        exchange_mic: Option<String>,
+        instrument_type: Option<&InstrumentType>,
+    ) -> (Option<String>, Option<String>) {
+        // A supplied MIC decides whether a trailing `.X` is a venue or part of the
+        // ticker: `ZAAA.F` on Cboe Canada is a hedged unit class, not a Frankfurt
+        // listing. See `parse_symbol_with_known_exchange`.
+        let (base_symbol, suffix_mic) = symbol
+            .map(|sym| parse_symbol_with_known_exchange(sym, exchange_mic.as_deref()))
+            .unwrap_or(("", None));
+        let exchange_mic = if matches!(
+            instrument_type,
+            Some(InstrumentType::Crypto | InstrumentType::Fx)
+        ) {
+            None
+        } else {
+            exchange_mic.or_else(|| suffix_mic.map(|mic| mic.to_string()))
+        };
+        let normalized_symbol = if base_symbol.is_empty() {
+            None
+        } else if instrument_type == Some(&InstrumentType::Crypto) {
+            Some(
+                parse_crypto_pair_symbol(base_symbol)
+                    .map(|(base, _)| base)
+                    .unwrap_or_else(|| base_symbol.to_string()),
+            )
+        } else if instrument_type == Some(&InstrumentType::Option) {
+            Some(
+                crate::utils::occ_symbol::normalize_option_symbol(base_symbol)
+                    .unwrap_or_else(|| base_symbol.to_string()),
+            )
+        } else {
+            Some(base_symbol.to_string())
+        };
+        (normalized_symbol, exchange_mic)
     }
 
     fn resolved_submitted_asset_id(
@@ -5043,41 +5296,16 @@ impl ActivityService {
             .map(Self::kind_from_instrument_type)
             .or_else(|| inferred.as_ref().map(|(kind, _)| kind.clone()));
 
-        // Normalize symbol + MIC using payload/suffix only (no live lookup for user save paths).
         let is_crypto = effective_instrument_type.as_ref() == Some(&InstrumentType::Crypto);
         let is_non_security_instrument = matches!(
             effective_instrument_type.as_ref(),
             Some(InstrumentType::Crypto | InstrumentType::Fx)
         );
-        // A supplied MIC decides whether a trailing `.X` is a venue or part of the
-        // ticker: `ZAAA.F` on Cboe Canada is a hedged unit class, not a Frankfurt
-        // listing. See `parse_symbol_with_known_exchange`.
-        let (base_symbol, suffix_mic) = symbol
-            .as_deref()
-            .map(|sym| parse_symbol_with_known_exchange(sym, exchange_mic.as_deref()))
-            .unwrap_or(("", None));
-        let exchange_mic = if is_non_security_instrument {
-            None
-        } else {
-            exchange_mic.or_else(|| suffix_mic.map(|mic| mic.to_string()))
-        };
-        let is_option = effective_instrument_type.as_ref() == Some(&InstrumentType::Option);
-        let normalized_symbol_for_lookup = if base_symbol.is_empty() {
-            None
-        } else if is_crypto {
-            Some(
-                parse_crypto_pair_symbol(base_symbol)
-                    .map(|(base, _)| base)
-                    .unwrap_or_else(|| base_symbol.to_string()),
-            )
-        } else if is_option {
-            Some(
-                crate::utils::occ_symbol::normalize_option_symbol(base_symbol)
-                    .unwrap_or_else(|| base_symbol.to_string()),
-            )
-        } else {
-            Some(base_symbol.to_string())
-        };
+        let (normalized_symbol_for_lookup, exchange_mic) = Self::submitted_lookup_identity(
+            symbol.as_deref(),
+            exchange_mic,
+            effective_instrument_type.as_ref(),
+        );
         let submitted_asset_id = self.resolved_submitted_asset_id(
             activity.get_symbol_id(),
             normalized_symbol_for_lookup.as_deref(),
@@ -5833,6 +6061,9 @@ impl ActivityService {
         let mut activities_with_status: Vec<ActivityImport> = Vec::new();
 
         for mut activity in activities {
+            // Recomputed below: a marker from an earlier check may be stale.
+            activity.duplicate_of_id = None;
+            activity.duplicate_of_line_number = None;
             activity.id = Some(Uuid::new_v4().to_string());
             if activity.account_name.is_none() {
                 activity.account_name = Some(account.name.clone());
@@ -6062,12 +6293,18 @@ impl ActivityService {
                     )
                 });
 
-            // Equity without MIC must either match an existing asset or be manual-quoted.
-            // Check AFTER find_existing_asset_id so custom assets (e.g. delisted TWTR)
-            // with no MIC are still matched.
+            // Equity without MIC must match an existing asset, be manual-quoted or be
+            // resolved by its provider without an exchange. Check AFTER
+            // find_existing_asset_id so custom assets (e.g. delisted TWTR) with no MIC
+            // are still matched.
             let is_equity = effective_kind == AssetKind::Investment
                 && effective_instrument_type.as_ref() == Some(&InstrumentType::Equity);
-            if is_equity && resolved_mic.is_none() && !is_manual_quote && existing_id.is_none() {
+            if is_equity
+                && resolved_mic.is_none()
+                && !is_manual_quote
+                && existing_id.is_none()
+                && !asset_resolution.is_some_and(|output| output.resolves_without_exchange)
+            {
                 activity.is_valid = false;
                 let mut errors = std::collections::HashMap::new();
                 errors.insert(
@@ -6271,7 +6508,7 @@ impl ActivityService {
                 .filter_map(|(activity, key)| key.as_ref().map(|_| activity)),
             &mut existing,
         )?;
-        let other_form_duplicates = self.find_other_asset_form_duplicates(
+        let rows_with_keys = || {
             activities_with_status
                 .iter()
                 .zip(&keys)
@@ -6279,9 +6516,14 @@ impl ActivityService {
                 .filter_map(|(idx, (activity, key))| {
                     key.as_ref()
                         .map(|_| (idx, activity, activity.asset_id.as_deref()))
-                }),
-            &existing,
-        )?;
+                })
+        };
+        let mut other_form_duplicates =
+            self.find_other_asset_form_duplicates(rows_with_keys(), &existing)?;
+        // A row with a source record ID also matches by its values an
+        // activity imported before its source sent IDs.
+        other_form_duplicates
+            .extend(self.find_duplicates_imported_without_source_ids(rows_with_keys())?);
 
         for (idx, maybe_key) in keys.iter().enumerate() {
             let Some(key) = maybe_key else {
@@ -6459,6 +6701,19 @@ impl ActivityServiceTrait for ActivityService {
             date_to_utc_exclusive,
             instrument_type_filter,
             activity_id_filter,
+        )
+    }
+
+    fn export_activities(
+        &self,
+        include_archived: bool,
+        date_from_utc: Option<DateTime<Utc>>,
+        date_to_utc_exclusive: Option<DateTime<Utc>>,
+    ) -> Result<ActivitySearchResponse> {
+        self.activity_repository.export_activities(
+            include_archived,
+            date_from_utc,
+            date_to_utc_exclusive,
         )
     }
 
@@ -7893,7 +8148,7 @@ impl ActivityServiceTrait for ActivityService {
         }
 
         let mut checked: Vec<ActivityImport> = ordered.into_iter().flatten().collect();
-        Self::flag_unpaired_conversion_imports(&mut checked);
+        self.flag_refused_conversion_imports(&mut checked)?;
         Ok(checked)
     }
 
@@ -7990,7 +8245,11 @@ impl ActivityServiceTrait for ActivityService {
                     .as_deref()
                     .map(|m| m.eq_ignore_ascii_case("MANUAL"))
                     .unwrap_or(false);
-                if is_equity && resolved.exchange_mic.is_none() && !is_manual {
+                if is_equity
+                    && resolved.exchange_mic.is_none()
+                    && !is_manual
+                    && !resolved.resolves_without_exchange
+                {
                     let mut errors = HashMap::new();
                     errors.insert(
                         "symbol".to_string(),
@@ -8300,7 +8559,7 @@ impl ActivityServiceTrait for ActivityService {
         )?;
         // Pass the asset step 4.5 resolved, so a symbol-only row is also
         // looked up under its asset ID.
-        let other_form_duplicates = self.find_other_asset_form_duplicates(
+        let rows_to_check = || {
             source_slice
                 .iter()
                 .zip(new_activities.iter())
@@ -8308,12 +8567,18 @@ impl ActivityServiceTrait for ActivityService {
                 .filter(|(position, _)| !policy_failed_positions.contains(position))
                 .map(|(position, (activity, prepared))| {
                     (position, activity, prepared.get_symbol_id())
-                }),
-            &existing_duplicates,
-        )?;
+                })
+        };
+        let mut other_form_duplicates =
+            self.find_other_asset_form_duplicates(rows_to_check(), &existing_duplicates)?;
+        // A row with a source record ID also matches by its values an
+        // activity imported before its source sent IDs.
+        other_form_duplicates
+            .extend(self.find_duplicates_imported_without_source_ids(rows_to_check())?);
 
         let mut duplicate_count = 0u32;
         let mut insertable_positions: Vec<usize> = Vec::with_capacity(new_activities.len());
+        let mut insertable_source_keys = HashSet::new();
 
         for (position, activity) in new_activities.iter_mut().enumerate() {
             if policy_failed_positions.contains(&position) {
@@ -8336,8 +8601,15 @@ impl ActivityServiceTrait for ActivityService {
             {
                 if is_force_import {
                     // User explicitly chose to import despite DB duplicate.
-                    // Clear key so the unique constraint is not violated.
-                    activity.idempotency_key = None;
+                    // Clear key so the unique constraint is not violated. A
+                    // source record key that only matched by values is free
+                    // and stays, so the row is found by its ID next time.
+                    if activity.source_record_id.is_none()
+                        || existing_duplicates.contains_key(&key)
+                        || !insertable_source_keys.insert(key)
+                    {
+                        activity.idempotency_key = None;
+                    }
                     insertable_positions.push(position);
                 } else {
                     if let Some((_, import_activity)) = import_activities_indexed.get_mut(position)
@@ -8357,7 +8629,9 @@ impl ActivityServiceTrait for ActivityService {
             if let Some(first_idx) = batch_dup_sources.get(&position).copied() {
                 if is_force_import {
                     // User explicitly chose to import despite batch duplicate.
-                    activity.idempotency_key = None;
+                    if activity.source_record_id.is_none() || !insertable_source_keys.insert(key) {
+                        activity.idempotency_key = None;
+                    }
                     insertable_positions.push(position);
                 } else {
                     let duplicate_line_number = import_activities_indexed
@@ -8382,6 +8656,9 @@ impl ActivityServiceTrait for ActivityService {
             }
 
             // Not a duplicate — force_import is a no-op, key is preserved.
+            if activity.source_record_id.is_some() {
+                insertable_source_keys.insert(key);
+            }
             insertable_positions.push(position);
         }
 
@@ -9938,6 +10215,8 @@ mod reviewed_import_metadata_tests {
             is_external: None,
             source_group_id: None,
             charges: None,
+            source_record_id: None,
+            metadata: None,
         }
     }
 

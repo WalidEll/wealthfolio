@@ -1,4 +1,6 @@
-import { act, fireEvent, render, screen, waitFor } from "@/test/render";
+import { act, fireEvent, render, screen, waitFor, within } from "@/test/render";
+import type { Account } from "@/lib/types";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider, useMutation } from "@tanstack/react-query";
 import { resetLocalTimeZone } from "@internationalized/date";
 import { Dialog } from "@wealthfolio/ui";
@@ -428,5 +430,115 @@ describe("ContributionLimitForm dates", () => {
         endDate: "2026-12-30T10:00:00.000Z",
       });
     });
+  });
+});
+
+describe("ContributionLimitForm amount", () => {
+  it("keeps a limit amount with more than two decimals", async () => {
+    mocks.updateLimit.mockClear();
+    render(
+      <Dialog open>
+        <ContributionLimitForm
+          defaultValues={{
+            id: "limit-1",
+            groupName: "BTC stack",
+            contributionYear: 2026,
+            limitAmount: 0.0015,
+          }}
+        />
+      </Dialog>,
+    );
+    expect(screen.getByRole("textbox", { name: "Limit amount" })).toHaveValue("0.0015");
+
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => expect(mocks.updateLimit).toHaveBeenCalledTimes(1));
+    expect(mocks.updateLimit.mock.calls[0][0].updatedLimit.limitAmount).toBe(0.0015);
+  });
+});
+
+describe("ContributionLimitForm accounts", () => {
+  const accounts = [
+    { id: "ira", name: "Roth IRA", accountType: "SECURITIES", isActive: true },
+    { id: "card", name: "Visa", accountType: "CREDIT_CARD", isActive: true },
+    { id: "old", name: "Old IRA", accountType: "SECURITIES", isActive: false },
+  ] as Account[];
+
+  it("lists accounts that can hold contributions and saves the ticked ones", async () => {
+    mocks.updateLimit.mockClear();
+    render(
+      <Dialog open>
+        <ContributionLimitForm
+          // "gone" is an account the list no longer shows; it stays selected.
+          defaultValues={{
+            id: "limit-1",
+            groupName: "IRA 2026",
+            contributionYear: 2026,
+            limitAmount: 7000,
+            accountIds: "gone,ira",
+          }}
+          accounts={accounts}
+        />
+      </Dialog>,
+    );
+
+    const group = screen.getByRole("group", { name: "Accounts that count" });
+    const boxes = within(group).getAllByRole("checkbox");
+    expect(group).toHaveTextContent("Roth IRA");
+    expect(group).toHaveTextContent("Old IRAHidden");
+    expect(group).not.toHaveTextContent("Visa");
+    expect(boxes.map((box) => box.getAttribute("aria-checked"))).toEqual(["true", "false"]);
+
+    fireEvent.click(within(group).getByText("Roth IRA"));
+    fireEvent.click(within(group).getByText("Old IRA"));
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    await waitFor(() => expect(mocks.updateLimit).toHaveBeenCalledTimes(1));
+    expect(mocks.updateLimit.mock.calls[0][0].updatedLimit.accountIds).toBe("gone,old");
+  });
+
+  it("lists ticked accounts first, counts them, and filters a long list by name", async () => {
+    const many = Array.from({ length: 10 }, (_, index) => ({
+      id: `acc-${index}`,
+      name: `Account ${String.fromCharCode(65 + index)}`,
+      accountType: "SECURITIES",
+      isActive: true,
+    })) as Account[];
+    render(
+      <Dialog open>
+        <ContributionLimitForm
+          defaultValues={{
+            id: "limit-1",
+            groupName: "IRA 2026",
+            contributionYear: 2026,
+            limitAmount: 7000,
+            accountIds: "acc-7",
+          }}
+          accounts={many}
+        />
+      </Dialog>,
+    );
+
+    const group = screen.getByRole("group", { name: "Accounts that count" });
+    expect(within(group).getAllByRole("checkbox")[0]).toHaveAccessibleName("Account H");
+    expect(screen.getByText("1 of 10 selected")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search accounts" }), {
+      target: { value: "account c" },
+    });
+    expect(within(group).getAllByRole("checkbox")).toHaveLength(1);
+    expect(within(group).getByText("Account C")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search accounts" }), {
+      target: { value: "zzz" },
+    });
+    expect(within(group).getByText("No accounts match your search.")).toBeInTheDocument();
+
+    // Enter in the search field filters; it doesn't save the limit.
+    mocks.updateLimit.mockClear();
+    await userEvent.type(screen.getByRole("searchbox", { name: "Search accounts" }), "{Enter}");
+    await Promise.resolve();
+    expect(mocks.updateLimit).not.toHaveBeenCalled();
+    expect(screen.getByRole("searchbox", { name: "Search accounts" })).toBeInTheDocument();
   });
 });

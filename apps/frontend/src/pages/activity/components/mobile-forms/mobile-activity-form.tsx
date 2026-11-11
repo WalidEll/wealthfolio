@@ -39,6 +39,7 @@ import { toast } from "sonner";
 import { useActivityMutations } from "../../hooks/use-activity-mutations";
 import { isConversionActivity } from "../../utils/conversion-counterpart";
 import { ActivityForm } from "../activity-form";
+import { CashActivityReclassification } from "../cash-activity-reclassification";
 import { showValidationToast, type AccountSelectOption } from "../forms/fields";
 import { createActivitySchemas, type NewActivityFormValues } from "../forms/schemas";
 import type { IncomeAmountTypedLast } from "../forms/use-income-amounts";
@@ -434,8 +435,9 @@ export function MobileActivityForm({
           : activity?.unitPrice
             ? Number(activity.unitPrice)
             : undefined,
-      fee: activity?.fee ? Number(activity.fee) : 0,
-      tax: activity?.tax ? Number(activity.tax) : 0,
+      // Saved charges arrive as strings: "0" opens empty too, so typing replaces it.
+      fee: Number(activity?.fee) || undefined,
+      tax: Number(activity?.tax) || undefined,
       comment: activity?.comment ?? null,
       subtype: activity?.subtype ?? null,
       fxRate,
@@ -894,6 +896,16 @@ export function MobileActivityForm({
       }
 
       if (id) {
+        // A transfer's empty fee is left out so a pair keeps both legs' fees, but
+        // an external transfer is one record: a fee the user cleared saves as 0,
+        // where omission would keep the old fee.
+        if (
+          transferIsExternal &&
+          submitData.fee === undefined &&
+          form.getFieldState("fee").isDirty
+        ) {
+          submitData.fee = 0;
+        }
         const wasAssetBackedIncome = isAssetBackedIncomeSubtype(
           activity?.activityType ?? "",
           activity?.subtype,
@@ -1078,6 +1090,11 @@ export function MobileActivityForm({
           {/* The header floats over this scroll area, which starts below it. */}
           <div className="min-h-0 flex-auto scroll-pt-(--sheet-header-height) overflow-y-auto pt-(--sheet-header-height)">
             <div className="p-4">
+              <CashActivityReclassification
+                activity={activity}
+                onSuccess={onClose}
+                disabled={isLoading}
+              />
               <Form {...form}>
                 <form onSubmit={handleValidatedSubmit} className="flex flex-col">
                   <MobileActivitySteps

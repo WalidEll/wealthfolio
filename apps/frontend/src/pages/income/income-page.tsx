@@ -1,11 +1,11 @@
 import { getIncomeSummary } from "@/adapters";
-import { Badge } from "@wealthfolio/ui/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@wealthfolio/ui/components/ui/card";
 import {
   ChartContainer,
   ChartTooltip,
   ChartTooltipContent,
 } from "@wealthfolio/ui/components/ui/chart";
+import { useDirection } from "@wealthfolio/ui/components/ui/direction";
 import {
   Empty,
   EmptyHeader,
@@ -17,6 +17,7 @@ import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { Skeleton } from "@wealthfolio/ui/components/ui/skeleton";
 import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
 import { AccountScopeSelector } from "@/components/account-filter-selector";
+import { TickerAvatar } from "@/components/ticker-avatar";
 import { useAccountScopeStore } from "@/lib/account-scope-store";
 
 import { QueryKeys } from "@/lib/query-keys";
@@ -89,6 +90,7 @@ export default function IncomePage() {
   const { isBalanceHidden } = useBalancePrivacy();
   const amountFormatting = useAmountFormatting();
   const numberFormatting = useNumberFormatting();
+  const direction = useDirection();
 
   const accountFilter = useAccountScopeStore((state) => state.scope);
   const setAccountScope = useAccountScopeStore((state) => state.setScope);
@@ -253,8 +255,12 @@ export default function IncomePage() {
               <Icons.DollarSign className="text-muted-foreground h-4 w-4" />
             </CardHeader>
             <CardContent>
-              <div className="flex items-center justify-between">
-                <div>
+              {/* The currency pie's tooltip is wider than the pie. Up to 1024 px,
+                  globals.css hides the overflow of every `.flex`; `!` beats that rule.
+                  There, globals.css also lets a long total break, so let it shrink
+                  beside the pie rather than spill out of the card. */}
+              <div className="flex items-center justify-between overflow-visible!">
+                <div className="[@media(width<=1024px)]:min-w-0">
                   <div className="text-2xl font-bold">
                     <AmountDisplay
                       value={totalIncome}
@@ -295,11 +301,14 @@ export default function IncomePage() {
                       },
                       {},
                     )}
-                    className="mx-auto aspect-square max-h-15.5"
+                    className="mx-auto aspect-square max-h-15.5 overflow-visible!"
                   >
                     <PieChart>
                       <ChartTooltip
                         cursor={false}
+                        // The pie ends the card's row: open the tooltip toward the card.
+                        allowEscapeViewBox={{ x: true }}
+                        reverseDirection={{ x: direction !== "rtl" }}
                         content={
                           <ChartTooltipContent
                             hideLabel
@@ -476,12 +485,12 @@ export default function IncomePage() {
                   </EmptyHeader>
                 </Empty>
               ) : (
-                <div className="space-y-6">
+                <div className="space-y-5">
                   {/* Horizontal Bar Chart - Separated Bars */}
                   <div className="flex w-full space-x-0.5">
                     {(() => {
-                      const top5Stocks = topDividendStocks.slice(0, 5);
-                      const otherStocks = topDividendStocks.slice(5);
+                      const top5Stocks = topDividendStocks.slice(0, DIVIDEND_BAR_TOP_SOURCES);
+                      const otherStocks = topDividendStocks.slice(DIVIDEND_BAR_TOP_SOURCES);
                       const otherTotal = otherStocks.reduce(
                         (sum, asset) => sum + asset.dividendIncome,
                         0,
@@ -508,15 +517,6 @@ export default function IncomePage() {
                           : []),
                       ];
 
-                      const colors = [
-                        "var(--chart-1)",
-                        "var(--chart-2)",
-                        "var(--chart-3)",
-                        "var(--chart-4)",
-                        "var(--chart-5)",
-                        "var(--chart-6)",
-                      ];
-
                       return chartItems.map((item, index) => {
                         const percentage =
                           dividendIncome > 0 ? (item.income / dividendIncome) * 100 : 0;
@@ -530,7 +530,7 @@ export default function IncomePage() {
                                 width: `${percentage}%`,
                                 backgroundColor: item.isOther
                                   ? "var(--chart-stone)"
-                                  : colors[index % colors.length],
+                                  : DIVIDEND_SOURCE_COLORS[index % DIVIDEND_SOURCE_COLORS.length],
                               }}
                             />
                             <TooltipContent className="bg-popover text-popover-foreground min-w-45 rounded-lg border px-3 py-2 shadow-md">
@@ -555,21 +555,43 @@ export default function IncomePage() {
                     })()}
                   </div>
 
-                  {topDividendStocks.map((asset) => (
-                    <div key={asset.assetId} className="flex items-center justify-between">
-                      <div className="flex items-center">
-                        <Badge className="bg-primary me-2 flex min-w-[3.4375rem] items-center justify-center rounded-sm text-xs">
-                          {asset.symbol}
-                        </Badge>
-                        <span className="text-muted-foreground me-16 text-xs">
-                          <bdi>{asset.name}</bdi>
-                        </span>
+                  <div className="space-y-2.5">
+                    {topDividendStocks.map((asset, index) => (
+                      <div key={asset.assetId} className="flex items-center justify-between gap-3">
+                        <div className="flex min-w-0 items-center gap-2.5">
+                          <TickerAvatar
+                            symbol={asset.symbol}
+                            assetId={asset.assetId}
+                            className="size-7 shrink-0"
+                          />
+                          <div className="min-w-0 leading-tight">
+                            <p className="truncate text-sm font-semibold">
+                              <bdi>{asset.symbol}</bdi>
+                            </p>
+                            <p className="text-muted-foreground truncate text-xs">
+                              <bdi>{asset.name}</bdi>
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-2">
+                          <span className="text-success text-sm">
+                            <PrivacyAmount value={asset.dividendIncome} currency={currency} />
+                          </span>
+                          {/* Its segment's colour in the bar above; the rest share "Other". */}
+                          <span
+                            aria-hidden
+                            className="h-3.5 w-1 rounded-full"
+                            style={{
+                              backgroundColor:
+                                index < DIVIDEND_BAR_TOP_SOURCES
+                                  ? DIVIDEND_SOURCE_COLORS[index]
+                                  : "var(--chart-stone)",
+                            }}
+                          />
+                        </div>
                       </div>
-                      <div className="text-success text-sm">
-                        <PrivacyAmount value={asset.dividendIncome} currency={currency} />
-                      </div>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
                 </div>
               )}
             </CardContent>
@@ -579,6 +601,17 @@ export default function IncomePage() {
     </>
   );
 }
+
+/** Sources the bar shows one by one; the rest share one "Other" segment. */
+const DIVIDEND_BAR_TOP_SOURCES = 5;
+const DIVIDEND_SOURCE_COLORS = [
+  "var(--chart-1)",
+  "var(--chart-2)",
+  "var(--chart-3)",
+  "var(--chart-4)",
+  "var(--chart-5)",
+  "var(--chart-6)",
+];
 
 function IncomeDashboardSkeleton() {
   return (

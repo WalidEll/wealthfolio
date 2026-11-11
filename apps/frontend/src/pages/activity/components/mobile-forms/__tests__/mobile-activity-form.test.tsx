@@ -2,12 +2,22 @@ import { ActivityEditCancelled } from "@/features/spending/components/activity-s
 import { toast } from "sonner";
 import { ActivityType, InstrumentType } from "@/lib/constants";
 import type { ActivityDetails } from "@/lib/types";
-import { render, screen, waitFor } from "@/test/render";
+import { render as renderWithFormatting, screen, waitFor } from "@/test/render";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import userEvent from "@testing-library/user-event";
-import { Activity, type ReactNode, type RefObject } from "react";
+import { Activity, type ReactElement, type ReactNode, type RefObject } from "react";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { AccountSelectOption } from "../../forms/fields";
 import { MobileActivityForm } from "../mobile-activity-form";
+
+function render(ui: ReactElement) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return renderWithFormatting(ui, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+}
 
 // The type step scrolls its options, and the scroll area needs a
 // ResizeObserver jsdom does not provide.
@@ -52,6 +62,8 @@ vi.mock("../mobile-details-step", async () => {
           data-testid="details-step"
           data-editing={String(!!isEditing)}
           data-quote-ccy={form.getValues("symbolQuoteCcy")}
+          data-fee={String(form.getValues("fee"))}
+          data-tax={String(form.getValues("tax"))}
         >
           {activityType ?? "no-type"}
           <input aria-label="Record notes" {...form.register("comment")} />
@@ -60,6 +72,12 @@ vi.mock("../mobile-details-step", async () => {
             onClick={() => form.setValue("activityDate", new Date("2026-02-01T10:00:00Z"))}
           >
             Correct record date
+          </button>
+          <button
+            type="button"
+            onClick={() => form.setValue("fee", undefined, { shouldDirty: true })}
+          >
+            Clear fee
           </button>
           <button
             type="button"
@@ -393,6 +411,100 @@ describe("a trade total typed on a phone screen left for another tab", () => {
         expect.objectContaining({ activityType: ActivityType.BUY, amount: 60 }),
       ),
     );
+  });
+});
+
+describe("saved charges on a phone edit", () => {
+  it("opens a saved 0 fee and tax empty and still saves them as 0", async () => {
+    noopMutation.mutateAsync.mockReset().mockResolvedValue({});
+    const user = userEvent.setup();
+    renderForm({ ...activity(ActivityType.DEPOSIT), amount: "100", fee: "0", tax: "0" });
+
+    const details = screen.getByTestId("details-step");
+    expect(details).toHaveAttribute("data-fee", "undefined");
+    expect(details).toHaveAttribute("data-tax", "undefined");
+
+    await user.click(screen.getByRole("button", { name: "Update Activity" }));
+    await waitFor(() =>
+      expect(noopMutation.mutateAsync).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ id: "act_1", amount: 100, fee: 0 }),
+      ),
+    );
+  });
+
+  it("saves a cleared fee as 0", async () => {
+    noopMutation.mutateAsync.mockReset().mockResolvedValue({});
+    const user = userEvent.setup();
+    renderForm({ ...activity(ActivityType.DEPOSIT), amount: "100", fee: "5" });
+
+    await user.click(screen.getByRole("button", { name: "Clear fee" }));
+    await user.click(screen.getByRole("button", { name: "Update Activity" }));
+    await waitFor(() =>
+      expect(noopMutation.mutateAsync).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ id: "act_1", amount: 100, fee: 0 }),
+      ),
+    );
+  });
+
+  it("saves an external transfer's cleared fee as 0", async () => {
+    noopMutation.mutateAsync.mockReset().mockResolvedValue({});
+    const user = userEvent.setup();
+    renderForm({
+      ...activity(ActivityType.TRANSFER_OUT),
+      amount: "100",
+      fee: "5",
+      metadata: { flow: { is_external: true } },
+    });
+
+    await user.click(screen.getByRole("button", { name: "Clear fee" }));
+    await user.click(screen.getByRole("button", { name: "Update Activity" }));
+    await waitFor(() =>
+      expect(noopMutation.mutateAsync).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ id: "act_1", activityType: ActivityType.TRANSFER_OUT, fee: 0 }),
+      ),
+    );
+  });
+
+  it("leaves both legs' fees as stored when a securities transfer's fee is cleared", async () => {
+    noopMutation.mutateAsync.mockReset().mockResolvedValue({});
+    const user = userEvent.setup();
+    render(
+      <MobileActivityForm
+        accounts={[...accounts, { value: "acc_2", label: "Other account", currency: "USD" }]}
+        open
+        onClose={vi.fn()}
+        activity={{
+          id: "pair-out",
+          activityType: ActivityType.TRANSFER_OUT,
+          accountId: "acc_1",
+          counterpartAccountId: "acc_2",
+          currency: "USD",
+          assetId: "asset-aapl",
+          assetSymbol: "AAPL",
+          quantity: "2",
+          unitPrice: "100",
+          fee: "5",
+          transferOutId: "pair-out",
+          transferInId: "pair-in",
+          date: new Date("2026-01-18T00:00:00Z"),
+        }}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Clear fee" }));
+    await user.click(screen.getByRole("button", { name: "Update Activity" }));
+    await waitFor(() => expect(noopMutation.mutateAsync).toHaveBeenCalledOnce());
+    const { updates } = noopMutation.mutateAsync.mock.calls[0][0];
+    expect(updates.map((leg: { id: string }) => leg.id)).toEqual(["pair-out", "pair-in"]);
+    for (const leg of updates) expect(leg.fee).toBeUndefined();
+  });
+
+  it("opens a saved charge with its value", () => {
+    renderForm({ ...activity(ActivityType.DEPOSIT), amount: "100", fee: "1.5", tax: "2" });
+
+    const details = screen.getByTestId("details-step");
+    expect(details).toHaveAttribute("data-fee", "1.5");
+    expect(details).toHaveAttribute("data-tax", "2");
   });
 });
 

@@ -21,7 +21,8 @@ fixtures; application APIs and persistence are not mocked.
 
 The easiest way to run the entire suite. Handles everything automatically:
 prepares a fresh database, starts the web app, waits for both servers, runs
-Playwright, and shuts everything down.
+Playwright, and shuts everything down. `.env.web` is created from
+`.env.web.example` when missing.
 
 ```bash
 pnpm test:e2e
@@ -53,14 +54,21 @@ restarting the server on every run.
 
 #### Step 1 — Prepare a fresh database
 
+If your shell exports an empty `WF_SECRET_KEY_FILE`, unset it first: the script
+and `dev:web` both prefer shell values over `.env.web`, so the empty value hides
+a key file set there and the script replaces it with a throwaway key.
+
 ```bash
 node scripts/prep-e2e.mjs
 ```
 
-This creates a unique timestamped data directory (e.g.
-`db/app-testing-20260411T120000Z-XXXXXX/`) and writes its database, vault, and
-addon paths to `.env.web`. The profile registry and profile databases stay in
-that directory too. **Run this every time** before starting the server —
+This creates `.env.web` from `.env.web.example` if needed, then a unique
+timestamped data directory (e.g. `db/app-testing-20260411T120000Z-XXXXXX/`), and
+writes its database, vault, and addon paths to `.env.web`. When neither
+`WF_SECRET_KEY` nor `WF_SECRET_KEY_FILE` is set, it also writes a throwaway
+server key to `secret.key` in that directory and points `WF_SECRET_KEY_FILE` at
+it; a key you set yourself is kept. The profile registry and profile databases
+stay in that directory too. **Run this every time** before starting the server —
 changing only the database filename would reuse the previous installation's
 profiles.
 

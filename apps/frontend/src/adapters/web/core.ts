@@ -4,8 +4,10 @@ import { profileFetch } from "@/features/profiles/session";
 
 import { notifyUnauthorized } from "@/lib/auth-token";
 import { BackendError, backendError } from "@/lib/backend-error";
+import type { ExportOptions } from "@/lib/types";
 import type { Logger } from "../types";
 import { invokeTimeoutMs } from "../invoke-timeout";
+import { exportOptionsQuery } from "./export-options";
 
 /** True in every Tauri build (desktop and mobile); use getPlatform() for the OS */
 export const isTauri = false;
@@ -201,6 +203,8 @@ export const COMMANDS: CommandMap = {
   create_category: { method: "POST", path: "/taxonomies/categories" },
   update_category: { method: "PUT", path: "/taxonomies/categories" },
   delete_category: { method: "DELETE", path: "/taxonomies" },
+  review_category_merge: { method: "POST", path: "/spending/categories/merge/review" },
+  merge_category: { method: "POST", path: "/spending/categories/merge" },
   move_category: { method: "POST", path: "/taxonomies/categories/move" },
   import_taxonomy_json: { method: "POST", path: "/taxonomies/import" },
   export_taxonomy_json: { method: "GET", path: "/taxonomies" },
@@ -378,6 +382,7 @@ export const COMMANDS: CommandMap = {
   // Net Worth
   get_net_worth: { method: "GET", path: "/net-worth" },
   get_net_worth_history: { method: "GET", path: "/net-worth/history" },
+  get_data_export_summary: { method: "GET", path: "/utilities/export/summary" },
   // AI Providers
   get_ai_providers: { method: "GET", path: "/ai/providers" },
   update_ai_provider_settings: { method: "PUT", path: "/ai/providers/settings" },
@@ -1276,6 +1281,11 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       url += `/${encodeURIComponent(taxonomyId)}/categories/${encodeURIComponent(categoryId)}`;
       break;
     }
+    case "review_category_merge":
+    case "merge_category": {
+      body = JSON.stringify(payload?.request);
+      break;
+    }
     case "move_category": {
       const { taxonomyId, categoryId, newParentId, position } = payload as {
         taxonomyId: string;
@@ -1394,13 +1404,14 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
       break;
     }
     case "assign_category_to_group": {
-      const { categoryId, groupId, periodKey } = payload as {
+      const { taxonomyId, categoryId, groupId, periodKey } = payload as {
+        taxonomyId: string;
         categoryId: string;
         groupId: string;
         periodKey?: string;
       };
       addPeriodKey(periodKey);
-      body = JSON.stringify({ categoryId, groupId });
+      body = JSON.stringify({ taxonomyId, categoryId, groupId });
       break;
     }
     case "reset_budget_groups": {
@@ -1910,6 +1921,11 @@ export const invoke = async <T>(command: string, payload?: Record<string, unknow
         params.set("date", date);
         url += `?${params.toString()}`;
       }
+      break;
+    }
+    case "get_data_export_summary": {
+      const { options } = (payload ?? {}) as { options?: ExportOptions };
+      url += exportOptionsQuery(options);
       break;
     }
     case "get_net_worth_history": {

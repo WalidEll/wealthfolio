@@ -30,9 +30,11 @@
       "unit_types": "tipos",
       "unit_currencies": "moedas",
       "unit_groups": "grupos",
-      "other_units": "Outros {{unit}}",
+      "other_units_one": "{{count}} outro item",
+      "other_units_other": "{{count}} outros itens",
+      "other_units_many": "{{count}} outros itens",
       "breakdown": "Detalhamento",
-      "top_units": "Principais {{unit}}",
+      "top_units": "{{count}} principais itens",
       "show_less": "Mostrar menos",
       "show_all": "Mostrar tudo"
     },
@@ -107,7 +109,8 @@
     "category_sheet": {
       "over_period": "em {{period}}",
       "trend_period": "Tendência · {{period}}",
-      "items": "Itens"
+      "items": "Itens",
+      "view_details": "Ver detalhes"
     },
     "trend": {
       "not_enough_history": "Histórico insuficiente"
@@ -149,7 +152,15 @@
     "portfolio_share": "Parcela do valor da carteira, incluindo o saldo em caixa",
     "largest": "Maior posição",
     "top_five": "Cinco maiores posições",
-    "concentration_unavailable": "A concentração exige posições com valores positivos e uma carteira sem posições vendidas."
+    "concentration_unavailable": "A concentração exige posições com valores positivos e uma carteira sem posições vendidas.",
+    "holdings": "Posições",
+    "holdings_count_one": "{{count}} posição",
+    "holdings_count_many": "{{count}} posições",
+    "holdings_count_other": "{{count}} posições",
+    "other_holdings_one": "{{count}} outra posição",
+    "other_holdings_many": "{{count}} outras posições",
+    "other_holdings_other": "{{count}} outras posições",
+    "holdings_unavailable": "O gráfico de posições requer valores positivos e uma carteira sem posições vendidas."
   },
   "customize": {
     "edit": "Personalizar",
