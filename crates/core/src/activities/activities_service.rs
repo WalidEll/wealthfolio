@@ -43,7 +43,7 @@ use rust_decimal::{Decimal, RoundingStrategy};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use crate::accounts::{account_types, Account, AccountServiceTrait};
+use crate::accounts::{account_types, is_liability_account_type, Account, AccountServiceTrait};
 use crate::activities::activities_constants::{
     classify_import_activity, is_cash_symbol, is_garbage_symbol, is_securities_transfer,
     requires_final_cash_amount, requires_symbol, ImportSymbolDisposition,
@@ -79,8 +79,9 @@ use crate::assets::loan::LOAN_PAYMENT_TAG_KEY;
 use crate::assets::{
     canonicalize_market_identity, normalize_quote_ccy_code, parse_crypto_pair_symbol,
     parse_symbol_with_known_exchange, resolve_bond_aliases, resolve_import_quote_ccy_precedence,
-    resolve_quote_ccy_precedence, AssetKind, AssetResolutionInput as ImportAssetResolutionInput,
-    AssetServiceTrait, AssetSpec, InstrumentType, QuoteCcyResolutionSource, QuoteMode,
+    resolve_quote_ccy_precedence, Asset, AssetKind,
+    AssetResolutionInput as ImportAssetResolutionInput, AssetServiceTrait, AssetSpec,
+    InstrumentType, QuoteCcyResolutionSource, QuoteMode,
 };
 use crate::errors::{DatabaseError, Error};
 use crate::events::{DomainEvent, DomainEventSink, NoOpDomainEventSink};
@@ -135,12 +136,6 @@ fn import_asset_resolution_key(activity: &ActivityImport, activity_currency: &st
         normalize_import_resolution_key_part(activity.provider_symbol.as_deref()),
     ]
     .join("::")
-}
-
-/// Resolved symbol information from a market data provider or asset DB lookup.
-#[derive(Debug, Default)]
-struct ResolvedSymbolInfo {
-    exchange_mic: Option<String>,
 }
 
 /// What an update makes of a transfer leg when it turns it into a securities
@@ -987,13 +982,39 @@ impl ActivityService {
             ));
         }
 
-        let cash_reclassification = matches!(
-            (existing.effective_type(), activity.activity_type.as_str()),
-            (ACTIVITY_TYPE_WITHDRAWAL, ACTIVITY_TYPE_TRANSFER_OUT)
-                | (ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL)
-                | (ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_TRANSFER_IN)
-                | (ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_DEPOSIT)
-        );
+        let type_change = (existing.effective_type(), activity.activity_type.as_str());
+        let is_card = |account_id: &str| -> Result<bool> {
+            Ok(is_liability_account_type(
+                &self.account_service.get_account(account_id)?.account_type,
+            ))
+        };
+        // A credit card's payment, which it cannot hold as a deposit. Elsewhere
+        // a credit is income or a refund whose subtype the edit sets, so a
+        // payment moved to a bank as a refund keeps that subtype. Its transfer
+        // flags are still cleared.
+        let (card_payment_change, lands_on_card) = if matches!(
+            type_change,
+            (ACTIVITY_TYPE_CREDIT, ACTIVITY_TYPE_TRANSFER_IN)
+                | (ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_CREDIT)
+        ) {
+            let lands_on_card = is_card(&activity.account_id)?;
+            let left_card = if activity.account_id == existing.account_id {
+                lands_on_card
+            } else {
+                is_card(&existing.account_id)?
+            };
+            (left_card || lands_on_card, lands_on_card)
+        } else {
+            (false, false)
+        };
+        let cash_reclassification = card_payment_change
+            || matches!(
+                type_change,
+                (ACTIVITY_TYPE_WITHDRAWAL, ACTIVITY_TYPE_TRANSFER_OUT)
+                    | (ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL)
+                    | (ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_TRANSFER_IN)
+                    | (ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_DEPOSIT)
+            );
         if cash_reclassification {
             if Self::non_cash_transfer_asset_key(existing).is_some() {
                 return Err(Self::invalid_activity_data(
@@ -1064,7 +1085,12 @@ impl ActivityService {
                 }
             }
             activity.metadata = Some(metadata.to_string());
-            activity.subtype = Some(String::new());
+            let bank_credit = card_payment_change
+                && !lands_on_card
+                && activity.activity_type == ACTIVITY_TYPE_CREDIT;
+            if !bank_credit {
+                activity.subtype = Some(String::new());
+            }
         }
 
         if activity
@@ -1578,15 +1604,10 @@ impl ActivityService {
     }
 
     fn duplicate_activity_error(existing_activity_id: Option<&str>) -> crate::errors::Error {
-        let message = if let Some(activity_id) = existing_activity_id {
-            format!(
-                "Duplicate activity detected. A matching activity already exists (id: {}).",
-                activity_id
-            )
-        } else {
-            "Duplicate activity detected. A matching activity already exists.".to_string()
-        };
-        ActivityError::InvalidData(message).into()
+        ActivityError::Duplicate {
+            existing_activity_id: existing_activity_id.map(str::to_string),
+        }
+        .into()
     }
 
     fn map_duplicate_idempotency_violation(err: crate::errors::Error) -> crate::errors::Error {
@@ -2085,6 +2106,22 @@ impl ActivityService {
         }
     }
 
+    /// The transfer `activity` becomes when converted: a cash flow's, or a
+    /// payment for a credit card's refund or credit. A card holds no deposits,
+    /// so a payment towards it can only have been saved as a credit.
+    fn conversion_transfer_type(&self, activity: &Activity) -> Result<Option<&'static str>> {
+        if let Some(transfer_type) = Self::cash_flow_transfer_type(activity) {
+            return Ok(Some(transfer_type));
+        }
+        if activity.effective_type() != ACTIVITY_TYPE_CREDIT
+            || Self::non_cash_transfer_asset_key(activity).is_some()
+        {
+            return Ok(None);
+        }
+        let account = self.account_service.get_account(&activity.account_id)?;
+        Ok(is_liability_account_type(&account.account_type).then_some(ACTIVITY_TYPE_TRANSFER_IN))
+    }
+
     fn is_in_transfer_pair(&self, activity: &Activity) -> Result<bool> {
         let Some(group_id) = activity
             .source_group_id
@@ -2108,9 +2145,9 @@ impl ActivityService {
         let source = self
             .activity_repository
             .get_activity(&request.activity_id)?;
-        let source_type = Self::cash_flow_transfer_type(&source).ok_or_else(|| {
+        let source_type = self.conversion_transfer_type(&source)?.ok_or_else(|| {
             Self::invalid_activity_data(
-                "Only cash deposits, withdrawals and transfers can become a transfer",
+                "Only cash deposits, withdrawals, transfers and card credits can become a transfer",
             )
         })?;
         if source.status == ActivityStatus::Void {
@@ -2653,6 +2690,51 @@ impl ActivityService {
             review.needs_review.push(UnlinkedTransfer {
                 activity: (*source).clone(),
                 link_state: *link_state,
+                candidates,
+            });
+        }
+
+        // A card payment a sync saved as the card's refund or credit: the same
+        // amount left another, non-card account within the window. Never
+        // certain, since a real refund can match a withdrawal by chance. Only a
+        // withdrawal: a one-sided transfer has its own row, so offering it here
+        // too would show one leg twice.
+        // Any open card, active or not, so no card's charge is offered as the
+        // bank side. Only an active card's credits are listed.
+        let card_account_ids: HashSet<String> = account_service
+            .get_non_archived_accounts()?
+            .into_iter()
+            .filter(|account| is_liability_account_type(&account.account_type))
+            .map(|account| account.id)
+            .collect();
+        let card_credits = scan.every_activity.iter().filter(|activity| {
+            activity.is_posted()
+                && card_account_ids.contains(&activity.account_id)
+                && scan.active_account_ids.contains(&activity.account_id)
+                && activity.effective_type() == ACTIVITY_TYPE_CREDIT
+                && Self::non_cash_transfer_asset_key(activity).is_none()
+        });
+        for source in card_credits {
+            let candidates: Vec<TransferMatchCandidate> = Self::transfer_match_candidates(
+                source,
+                &[ACTIVITY_TYPE_WITHDRAWAL],
+                &pool,
+                WINDOW_DAYS,
+                usize::MAX,
+            )
+            .into_iter()
+            .filter(|candidate| {
+                !card_account_ids.contains(&candidate.activity.account_id)
+                    && !covered.contains(candidate.activity.id.as_str())
+            })
+            .take(CANDIDATES_SHOWN)
+            .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            review.needs_review.push(UnlinkedTransfer {
+                activity: source.clone(),
+                link_state: TransferLinkState::NeedsCounterpart,
                 candidates,
             });
         }
@@ -4109,11 +4191,11 @@ impl ActivityService {
     /// Resolves (symbol, currency, optional ISIN) keys to exchange MICs in batch.
     /// AssetService owns import asset resolution, including local DB matching and
     /// provider fallback; ActivityService only consumes the exchange result.
-    /// Returns a `ResolvedSymbolInfo` for each resolution key.
+    /// Returns the resolver's output for each resolution key.
     async fn resolve_symbols_batch(
         &self,
         resolution_keys: HashSet<SymbolResolutionKey>,
-    ) -> HashMap<SymbolResolutionKey, ResolvedSymbolInfo> {
+    ) -> HashMap<SymbolResolutionKey, crate::assets::AssetResolutionOutput> {
         if resolution_keys.is_empty() {
             return HashMap::new();
         }
@@ -4141,6 +4223,7 @@ impl ActivityService {
                     asset_id: None,
                     provider_id: None,
                     provider_symbol: None,
+                    name: None,
                 }
             })
             .collect();
@@ -4155,40 +4238,46 @@ impl ActivityService {
 
         outputs
             .into_iter()
-            .filter_map(|output| {
-                key_by_input.remove(&output.key).map(|key| {
-                    (
-                        key,
-                        ResolvedSymbolInfo {
-                            exchange_mic: output.exchange_mic,
-                        },
-                    )
-                })
-            })
+            .filter_map(|output| key_by_input.remove(&output.key).map(|key| (key, output)))
             .collect()
     }
 
-    /// Convenience wrapper: resolves symbols using a single currency for all.
-    /// Used by callers where per-activity currency isn't available (broker sync, prepare).
-    /// Returns only exchange MIC (name not needed for those callers).
-    async fn resolve_symbols_batch_single_currency(
-        &self,
-        symbols: HashSet<String>,
-        currency: &str,
-    ) -> HashMap<String, Option<String>> {
-        let pairs: HashSet<(String, String)> = symbols
+    /// Upper-case tickers broker sync doesn't search a listing for: an equity
+    /// has no exchange and no asset of that ticker is on a listing, however the
+    /// asset is priced. The user cleared the exchange or none was ever known,
+    /// and a search can file a private fund such as Fidelity's `OAA1` under an
+    /// unrelated company's listing.
+    fn tickers_kept_without_exchange(&self) -> Result<HashSet<String>> {
+        let ticker = |asset: &Asset| {
+            asset
+                .instrument_symbol
+                .as_deref()
+                .map(|symbol| symbol.trim().to_uppercase())
+                .filter(|symbol| !symbol.is_empty())
+        };
+        let has_exchange = |asset: &Asset| {
+            asset
+                .instrument_exchange_mic
+                .as_deref()
+                .is_some_and(|mic| !mic.trim().is_empty())
+        };
+        let equities: Vec<Asset> = self
+            .asset_service
+            .get_assets()?
             .into_iter()
-            .map(|s| (s, currency.to_string()))
+            .filter(|asset| asset.instrument_type == Some(InstrumentType::Equity))
             .collect();
-        let resolution_keys: HashSet<SymbolResolutionKey> = pairs
-            .into_iter()
-            .map(|(symbol, currency)| (symbol, currency, None))
+        let listed: HashSet<String> = equities
+            .iter()
+            .filter(|asset| has_exchange(asset))
+            .filter_map(ticker)
             .collect();
-        self.resolve_symbols_batch(resolution_keys)
-            .await
-            .into_iter()
-            .map(|((sym, _, _), info)| (sym, info.exchange_mic))
-            .collect()
+        Ok(equities
+            .iter()
+            .filter(|asset| !has_exchange(asset))
+            .filter_map(ticker)
+            .filter(|symbol| !listed.contains(symbol))
+            .collect())
     }
 
     /// Creates a quote from activity data to serve as a price fallback.
@@ -6083,6 +6172,7 @@ impl ActivityService {
             asset_id: activity.asset_id.clone(),
             provider_id: None,
             provider_symbol: None,
+            name: None,
         }
         .reviewed_metadata_is_sufficient()
     }
@@ -6162,6 +6252,7 @@ impl ActivityService {
                     asset_id: a.asset_id.clone(),
                     provider_id: a.provider_id.clone(),
                     provider_symbol: a.provider_symbol.clone(),
+                    name: None,
                 })
             })
             .collect();
@@ -7469,14 +7560,26 @@ impl ActivityServiceTrait for ActivityService {
             .activity_repository
             .get_activity(&request.activity_id)?;
         // A deposit or withdrawal can be converted into a transfer, so its
-        // candidates include both plain cash flows and transfers.
+        // candidates include both plain cash flows and transfers. So can a
+        // card's credit, which a payment towards the card is saved as.
+        let is_cash = Self::cash_flow_transfer_type(&source).is_some();
+        let with_cash_flows = is_cash && request.include_cash_flows;
         let counterpart_types: &[&str] = match source.effective_type() {
+            ACTIVITY_TYPE_TRANSFER_IN if with_cash_flows => {
+                &[ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL]
+            }
             ACTIVITY_TYPE_TRANSFER_IN => &[ACTIVITY_TYPE_TRANSFER_OUT],
+            ACTIVITY_TYPE_TRANSFER_OUT if with_cash_flows => {
+                &[ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_DEPOSIT]
+            }
             ACTIVITY_TYPE_TRANSFER_OUT => &[ACTIVITY_TYPE_TRANSFER_IN],
-            ACTIVITY_TYPE_WITHDRAWAL if Self::cash_flow_transfer_type(&source).is_some() => {
+            ACTIVITY_TYPE_WITHDRAWAL if is_cash => {
                 &[ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_TRANSFER_IN]
             }
-            ACTIVITY_TYPE_DEPOSIT if Self::cash_flow_transfer_type(&source).is_some() => {
+            ACTIVITY_TYPE_DEPOSIT if is_cash => {
+                &[ACTIVITY_TYPE_WITHDRAWAL, ACTIVITY_TYPE_TRANSFER_OUT]
+            }
+            ACTIVITY_TYPE_CREDIT if self.conversion_transfer_type(&source)?.is_some() => {
                 &[ACTIVITY_TYPE_WITHDRAWAL, ACTIVITY_TYPE_TRANSFER_OUT]
             }
             _ => {
@@ -7491,10 +7594,17 @@ impl ActivityServiceTrait for ActivityService {
             return Ok(Vec::new());
         }
 
+        // Only a cash deposit or withdrawal can be converted.
+        let convertible = all_activities.iter().filter(|candidate| {
+            !matches!(
+                candidate.effective_type(),
+                ACTIVITY_TYPE_DEPOSIT | ACTIVITY_TYPE_WITHDRAWAL
+            ) || Self::cash_flow_transfer_type(candidate).is_some()
+        });
         Ok(Self::transfer_match_candidates(
             &source,
             counterpart_types,
-            &TransferCandidatePool::new(&all_activities, &transfer_resolution),
+            &TransferCandidatePool::new(convertible, &transfer_resolution),
             request.window_days.unwrap_or(7).clamp(0, 90),
             request.limit.unwrap_or(25).clamp(1, 100),
         ))
@@ -7675,7 +7785,8 @@ impl ActivityServiceTrait for ActivityService {
                 source.id.clone(),
                 counterpart.map(|counterpart| counterpart.id),
             )
-            .await?;
+            .await
+            .map_err(Self::map_duplicate_idempotency_violation)?;
 
         let mut account_ids: HashSet<String> = HashSet::new();
         let mut asset_ids: HashSet<String> = HashSet::new();
@@ -8330,6 +8441,7 @@ impl ActivityServiceTrait for ActivityService {
                     asset_id: None,
                     provider_id: candidate.provider_id.clone(),
                     provider_symbol: candidate.provider_symbol.clone(),
+                    name: candidate.name.clone(),
                 }
             })
             .collect();
@@ -8966,6 +9078,7 @@ impl ActivityServiceTrait for ActivityService {
                 .activity_repository
                 .create_activities_returning(insertable_new_activities)
                 .await
+                .map_err(Self::map_duplicate_idempotency_violation)
             {
                 Ok(rows) => rows,
                 Err(e) => {
@@ -9530,8 +9643,9 @@ impl ActivityService {
         let account_currency = resolve_currency(&[&account.currency, &base_ccy]);
 
         // 1. Batch resolve symbols → MICs when live resolution is enabled.
-        let symbol_mic_cache = if mode.allows_live_resolution() {
-            let symbols_to_resolve: HashSet<String> = activities
+        let symbol_mic_cache: HashMap<String, Option<String>> = if mode.allows_live_resolution() {
+            let kept_without_exchange = self.tickers_kept_without_exchange()?;
+            let symbols_to_resolve: HashSet<SymbolResolutionKey> = activities
                 .iter()
                 .filter_map(|a| {
                     let symbol = a.get_symbol_code()?;
@@ -9543,16 +9657,23 @@ impl ActivityService {
                         Some(InstrumentType::Crypto | InstrumentType::Fx)
                     );
                     let is_cash = symbol.starts_with("CASH:");
-                    if !has_mic && !is_cash && !is_non_security_instrument {
-                        Some(symbol.to_string())
+                    if !has_mic
+                        && !is_cash
+                        && !is_non_security_instrument
+                        && !kept_without_exchange.contains(&symbol.trim().to_uppercase())
+                    {
+                        Some((symbol.to_string(), account_currency.clone(), None))
                     } else {
                         None
                     }
                 })
                 .collect();
 
-            self.resolve_symbols_batch_single_currency(symbols_to_resolve, &account_currency)
+            self.resolve_symbols_batch(symbols_to_resolve)
                 .await
+                .into_iter()
+                .map(|((symbol, _, _), output)| (symbol, output.exchange_mic))
+                .collect()
         } else {
             HashMap::new()
         };
@@ -10420,5 +10541,30 @@ mod reviewed_import_metadata_tests {
             import_with_metadata("MYCO", Some("EQUITY"), Some("USD"), None, Some("MANUAL"));
 
         assert!(ActivityService::reviewed_import_asset_metadata_is_sufficient(&activity));
+    }
+}
+
+#[cfg(test)]
+mod duplicate_idempotency_violation_tests {
+    use super::ActivityService;
+    use crate::errors::{DatabaseError, Error};
+
+    #[test]
+    fn a_unique_violation_on_the_idempotency_key_is_a_public_duplicate_refusal() {
+        for error in [
+            DatabaseError::UniqueViolation(
+                "UNIQUE constraint failed: activities.idempotency_key".into(),
+            ),
+            DatabaseError::Internal("UNIQUE constraint failed: activities.idempotency_key".into()),
+        ] {
+            let mapped = ActivityService::map_duplicate_idempotency_violation(Error::from(error));
+            assert_eq!(mapped.public_error().error_code, "DUPLICATE_ACTIVITY");
+        }
+
+        // Other unique violations keep their generic conflict code.
+        let other = ActivityService::map_duplicate_idempotency_violation(Error::from(
+            DatabaseError::UniqueViolation("UNIQUE constraint failed: assets.id".into()),
+        ));
+        assert_eq!(other.public_error().error_code, "conflict");
     }
 }

@@ -5,8 +5,9 @@ pub(crate) mod tests {
     use crate::activities::{
         ActivityCharge, ActivityChargeCategory, ActivityRepositoryTrait, ActivityService,
         ActivityServiceTrait, ImportRun, ImportRunRepositoryTrait, ImportRunStatus,
-        TransferLinkState, TransferPairResolution, ACTIVITY_TYPE_ADJUSTMENT, ACTIVITY_TYPE_DEPOSIT,
-        ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_WITHDRAWAL,
+        TransferLinkState, TransferPairResolution, ACTIVITY_TYPE_ADJUSTMENT, ACTIVITY_TYPE_CREDIT,
+        ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT,
+        ACTIVITY_TYPE_WITHDRAWAL,
     };
     use crate::assets::{
         canonicalize_market_identity, normalize_quote_ccy_code, parse_crypto_pair_symbol,
@@ -106,11 +107,25 @@ pub(crate) mod tests {
         }
 
         fn get_non_archived_accounts(&self) -> Result<Vec<Account>> {
-            Ok(self.accounts.lock().unwrap().clone())
+            Ok(self
+                .accounts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|account| !account.is_archived)
+                .cloned()
+                .collect())
         }
 
         fn get_active_non_archived_accounts(&self) -> Result<Vec<Account>> {
-            Ok(self.accounts.lock().unwrap().clone())
+            Ok(self
+                .accounts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|account| account.is_active && !account.is_archived)
+                .cloned()
+                .collect())
         }
 
         fn get_base_currency(&self) -> Option<String> {
@@ -123,6 +138,7 @@ pub(crate) mod tests {
     struct MockAssetService {
         assets: Arc<Mutex<Vec<Asset>>>,
         get_asset_by_id_error: Arc<Mutex<Option<String>>>,
+        get_assets_error: Arc<Mutex<Option<String>>>,
         resolve_import_asset_input_batches: Arc<Mutex<Vec<Vec<ImportAssetResolutionInput>>>>,
         ensure_asset_input_batches: Arc<Mutex<Vec<Vec<crate::assets::AssetSpec>>>>,
     }
@@ -132,6 +148,7 @@ pub(crate) mod tests {
             Self {
                 assets: Arc::new(Mutex::new(Vec::new())),
                 get_asset_by_id_error: Arc::new(Mutex::new(None)),
+                get_assets_error: Arc::new(Mutex::new(None)),
                 resolve_import_asset_input_batches: Arc::new(Mutex::new(Vec::new())),
                 ensure_asset_input_batches: Arc::new(Mutex::new(Vec::new())),
             }
@@ -156,6 +173,9 @@ pub(crate) mod tests {
     #[async_trait]
     impl AssetServiceTrait for MockAssetService {
         fn get_assets(&self) -> Result<Vec<Asset>> {
+            if let Some(message) = self.get_assets_error.lock().unwrap().clone() {
+                return Err(Error::Unexpected(message));
+            }
             Ok(self.assets.lock().unwrap().clone())
         }
 
@@ -379,6 +399,16 @@ pub(crate) mod tests {
                             "Berkshire Hathaway Inc.".to_string(),
                             "BRK-B".to_string(),
                         ))
+                    } else if source_symbol.eq_ignore_ascii_case("OAA1") {
+                        // The only listings a search finds are German ones of an
+                        // unrelated company, as Yahoo returns for this ticker.
+                        Some((
+                            "OAA1".to_string(),
+                            "XSTU".to_string(),
+                            "EUR".to_string(),
+                            "Power Metals Corp.".to_string(),
+                            "OAA1.SG".to_string(),
+                        ))
                     } else if source_symbol.eq_ignore_ascii_case("VOD.L") {
                         Some((
                             "VOD".to_string(),
@@ -522,21 +552,30 @@ pub(crate) mod tests {
                         .as_deref()
                         .and_then(wealthfolio_market_data::mic_to_currency)
                         .map(str::to_string);
+                    // As in the real resolver, the activity's currency names the
+                    // listing only when the row also names a venue.
+                    let has_market_hint = input.exchange_mic.is_some() || suffix_mic.is_some();
                     let activity_quote_ccy = input
                         .activity_currency
                         .clone()
-                        .filter(|currency| !currency.trim().is_empty());
+                        .filter(|currency| has_market_hint && !currency.trim().is_empty());
+                    // The last resort is still the activity's currency.
+                    let terminal_currency = input
+                        .activity_currency
+                        .clone()
+                        .filter(|currency| !currency.trim().is_empty())
+                        .unwrap_or_else(|| input.account_currency.clone());
                     let (quote_ccy, quote_ccy_source) = resolve_import_quote_ccy_precedence(
                         explicit_quote_ccy.as_deref().or(pair_quote.as_deref()),
                         existing_quote_ccy.as_deref(),
                         activity_quote_ccy.as_deref(),
                         provider_quote_ccy.as_deref(),
                         mic_quote_ccy.as_deref(),
-                        Some(input.account_currency.as_str()),
+                        Some(terminal_currency.as_str()),
                     )
                     .unwrap_or_else(|| {
                         (
-                            input.account_currency.clone(),
+                            terminal_currency.clone(),
                             QuoteCcyResolutionSource::TerminalFallback,
                         )
                     });
@@ -1378,6 +1417,9 @@ pub(crate) mod tests {
         activities: Arc<Mutex<Vec<Activity>>>,
         /// Accounts whose rows `get_activities` leaves out, as storage does.
         archived_accounts: Arc<Mutex<HashSet<String>>>,
+        /// Writes fail as SQLite does when another writer stored the same
+        /// idempotency key after the service's duplicate check.
+        idempotency_conflict_on_write: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MockActivityRepository {
@@ -1387,6 +1429,23 @@ pub(crate) mod tests {
 
         fn add_activity(&self, activity: Activity) {
             self.activities.lock().unwrap().push(activity);
+        }
+
+        fn fail_writes_with_idempotency_conflict(&self) {
+            self.idempotency_conflict_on_write
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn idempotency_conflict(&self) -> Result<()> {
+            if self
+                .idempotency_conflict_on_write
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(Error::Database(DatabaseError::UniqueViolation(
+                    "UNIQUE constraint failed: activities.idempotency_key".to_string(),
+                )));
+            }
+            Ok(())
         }
 
         fn archive_account(&self, account_id: &str) {
@@ -1726,6 +1785,7 @@ pub(crate) mod tests {
             activity_id: String,
             counterpart_id: Option<String>,
         ) -> Result<(Activity, Activity)> {
+            self.idempotency_conflict()?;
             // Restore the snapshot on failure, like the SQLite transaction.
             let snapshot = self.activities.lock().unwrap().clone();
             let result = async {
@@ -1789,6 +1849,7 @@ pub(crate) mod tests {
             &self,
             _activities: Vec<NewActivity>,
         ) -> Result<Vec<Activity>> {
+            self.idempotency_conflict()?;
             let mut stored = self.activities.lock().unwrap();
             let mut created = Vec::new();
             for new_activity in _activities {
@@ -2251,6 +2312,168 @@ pub(crate) mod tests {
             quote_service.updated_quotes().is_empty(),
             "transfer unit_price is book basis and must not be written as a quote"
         );
+    }
+
+    #[tokio::test]
+    async fn test_option_expiry_fix_moves_a_stock_expiry_onto_its_contract() {
+        // #2655: the broker sent the expiry with only the underlying stock and
+        // no units. The fix moves it onto the one contract held that day.
+        use crate::health::fixes::option_expiry::tests::held;
+        use crate::health::fixes::{
+            match_option_expiry_contracts, MatchOptionExpiryContractsPayload,
+        };
+
+        let account_service = Arc::new(MockAccountService::new());
+        let asset_service = Arc::new(MockAssetService::new());
+        let activity_repository = Arc::new(MockActivityRepository::new());
+        account_service.add_account(create_test_account("fhsa", "USD"));
+        asset_service.add_asset(create_test_asset_with_instrument(
+            "rgld",
+            "RGLD",
+            Some("XNAS"),
+            Some(InstrumentType::Equity),
+            "USD",
+        ));
+        asset_service.add_asset(create_test_asset_with_instrument(
+            "rgld-c195",
+            "RGLD260717C00195000",
+            None,
+            Some(InstrumentType::Option),
+            "USD",
+        ));
+        let at: DateTime<Utc> = "2026-07-17T21:30:00Z".parse().unwrap();
+        let mut expiry = create_stored_activity("exp", "fhsa", Some("rgld"));
+        expiry.activity_type = "ADJUSTMENT".to_string();
+        expiry.subtype = Some("OPTION_EXPIRY".to_string());
+        expiry.activity_date = at;
+        expiry.quantity = Some(dec!(0));
+        expiry.unit_price = Some(dec!(0));
+        expiry.amount = Some(dec!(0));
+        expiry.notes = Some("Option expired: RGLD".to_string());
+        expiry.needs_review = true;
+        activity_repository.add_activity(expiry);
+        let mut buy = create_stored_activity("buy", "fhsa", Some("rgld-c195"));
+        buy.activity_date = "2026-07-13T14:17:00Z".parse().unwrap();
+        buy.quantity = Some(dec!(2));
+        buy.unit_price = Some(dec!(2.5));
+        buy.amount = Some(dec!(500));
+        activity_repository.add_activity(buy);
+        // The engine over the stored rows, with the facts the coordinator gives it.
+        let project = || {
+            use crate::portfolio::coordinator::{raw_activity, raw_asset};
+            use wealthfolio_portfolio_engine::model::{Currency, Policy, RawAccount, RawFacts};
+            let raw = RawFacts {
+                policy: Policy::new(
+                    Currency::parse("USD").unwrap(),
+                    chrono_tz::UTC,
+                    NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+                ),
+                accounts: vec![RawAccount {
+                    id: "fhsa".to_string(),
+                    currency: "USD".to_string(),
+                    account_type: "SECURITIES".to_string(),
+                    tracking_mode: "TRANSACTIONS".to_string(),
+                    is_archived: false,
+                    cost_basis_method: None,
+                }],
+                assets: asset_service
+                    .get_assets()
+                    .unwrap()
+                    .iter()
+                    .map(raw_asset)
+                    .collect(),
+                activities: activity_repository
+                    .get_activities()
+                    .unwrap()
+                    .iter()
+                    .map(raw_activity)
+                    .collect(),
+                quotes: Vec::new(),
+                fx_rates: Vec::new(),
+                observed_snapshots: Vec::new(),
+            };
+            wealthfolio_portfolio_engine::Engine::new(raw)
+                .unwrap()
+                .project()
+                .unwrap()
+        };
+        let before = project();
+        assert!(before
+            .rejected_activities()
+            .iter()
+            .any(|id| id.as_str() == "exp"));
+        assert!(
+            before.disposals.is_empty(),
+            "the stock-keyed expiry closes nothing"
+        );
+        let activity_service = Arc::new(ActivityService::new(
+            activity_repository.clone(),
+            account_service.clone(),
+            asset_service.clone(),
+            Arc::new(MockFxService::new()),
+            Arc::new(MockQuoteService),
+        ));
+        let snapshots = Arc::new(held(&[("fhsa", "2026-07-17", &[("rgld-c195", 2)])]));
+        // The check's timezone travels in the payload; none is configured.
+        let payload = |ids: &[&str]| MatchOptionExpiryContractsPayload {
+            activity_ids: ids.iter().map(|id| id.to_string()).collect(),
+            timezone: Some("America/Toronto".to_string()),
+        };
+
+        let moved = match_option_expiry_contracts(
+            activity_service.clone(),
+            account_service.clone(),
+            asset_service.clone(),
+            snapshots.clone(),
+            payload(&["exp"]),
+            None,
+        )
+        .await
+        .expect("the expiry has one matching contract");
+
+        assert_eq!(moved, 1);
+        let stored = activity_repository.get_activity("exp").unwrap();
+        assert_eq!(stored.asset_id.as_deref(), Some("rgld-c195"));
+        assert_eq!(stored.quantity, Some(dec!(2)));
+        assert_eq!(stored.subtype.as_deref(), Some("OPTION_EXPIRY"));
+        assert_eq!(stored.activity_date, at);
+        assert_eq!(stored.notes.as_deref(), Some("Option expired: RGLD"));
+        assert!(!stored.needs_review);
+
+        // The engine now closes the contracts at zero proceeds: the premium
+        // paid is the realized loss.
+        let after = project();
+        assert!(after.rejected_activities().is_empty());
+        let realized: Decimal = after
+            .disposals
+            .iter()
+            .filter(|disposal| disposal.asset.as_str() == "rgld-c195")
+            .map(|disposal| {
+                assert_eq!(disposal.proceeds, Decimal::ZERO);
+                disposal.realized_pnl
+            })
+            .sum();
+        assert_eq!(realized, dec!(-500));
+        let account = &after.final_state.accounts
+            [&wealthfolio_portfolio_engine::model::AccountId::new("fhsa")];
+        let contract = account
+            .positions
+            .get(&wealthfolio_portfolio_engine::model::AssetId::new(
+                "rgld-c195",
+            ));
+        assert!(contract.is_none_or(|position| position.quantity.is_zero()));
+
+        // Applying again finds nothing left to move.
+        let again = match_option_expiry_contracts(
+            activity_service,
+            account_service,
+            asset_service,
+            snapshots,
+            payload(&["exp"]),
+            None,
+        )
+        .await;
+        assert!(again.is_err());
     }
 
     #[tokio::test]
@@ -3720,6 +3943,348 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// Every prepared row links to `asset_id`, so a test can't pass with the
+    /// asset created but the activities left unlinked.
+    fn assert_linked_to(result: &PrepareActivitiesResult, asset_id: &str) {
+        assert!(!result.prepared.is_empty());
+        for prepared in &result.prepared {
+            assert_eq!(prepared.activity.get_symbol_id(), Some(asset_id));
+        }
+    }
+
+    fn broker_buy(account_id: &str, symbol: &str, currency: &str) -> NewActivity {
+        NewActivity {
+            id: None,
+            account_id: account_id.to_string(),
+            asset: Some(AssetResolutionInput {
+                symbol: Some(symbol.to_string()),
+                ..Default::default()
+            }),
+            activity_type: "BUY".to_string(),
+            subtype: None,
+            activity_date: "2026-11-02".to_string(),
+            quantity: Some(dec!(10)),
+            unit_price: Some(dec!(25)),
+            amount: Some(dec!(250)),
+            currency: currency.to_string(),
+            fee: None,
+            tax: None,
+            status: Some(ActivityStatus::Posted),
+            notes: None,
+            fx_rate: None,
+            metadata: None,
+            needs_review: None,
+            source_system: Some("SNAPTRADE".to_string()),
+            source_record_id: None,
+            source_group_id: None,
+            idempotency_key: None,
+            import_run_id: None,
+        }
+    }
+
+    fn broker_sync_service(
+        account: &Account,
+        assets: Vec<Asset>,
+    ) -> (ActivityService, Arc<MockAssetService>) {
+        let account_service = Arc::new(MockAccountService::new());
+        account_service.add_account(account.clone());
+        let asset_service = Arc::new(MockAssetService::new());
+        for asset in assets {
+            asset_service.add_asset(asset);
+        }
+        let service = ActivityService::new(
+            Arc::new(MockActivityRepository::new()),
+            account_service,
+            asset_service.clone(),
+            Arc::new(MockFxService::new()),
+            Arc::new(MockQuoteService),
+        );
+        (service, asset_service)
+    }
+
+    fn oaa1_without_an_exchange(quote_ccy: &str) -> Asset {
+        let mut asset = create_test_asset_with_instrument(
+            "oaa1",
+            "OAA1",
+            None,
+            Some(InstrumentType::Equity),
+            quote_ccy,
+        );
+        asset.instrument_key = Some("EQUITY:OAA1".to_string());
+        asset.quote_mode = QuoteMode::Market;
+        asset
+    }
+
+    /// A ticker sync sees for the first time takes the listing the search found.
+    #[tokio::test]
+    async fn sync_files_a_new_ticker_on_the_searched_listing() {
+        let account = create_test_account("acc-usd", "USD");
+        let (service, asset_service) = broker_sync_service(&account, Vec::new());
+
+        let result = service
+            .prepare_activities_for_sync(vec![broker_buy(&account.id, "OAA1", "USD")], &account)
+            .await
+            .expect("sync preparation");
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let assets = asset_service.get_assets().unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_linked_to(&result, &assets[0].id);
+        assert_eq!(
+            assets[0].instrument_key.as_deref(),
+            Some("EQUITY:OAA1@XSTU")
+        );
+    }
+
+    /// Once a ticker is held without an exchange, sync doesn't search for one,
+    /// whatever currency the asset or the activity is in. Clearing `OAA1` and
+    /// leaving it priced in EUR must not bring back the Stuttgart listing.
+    #[tokio::test]
+    async fn sync_keeps_a_ticker_held_without_an_exchange_off_every_listing() {
+        for (asset_ccy, activity_ccy, symbol) in [
+            ("USD", "USD", "OAA1"),
+            ("EUR", "USD", "OAA1"),
+            ("USD", "EUR", "OAA1"),
+            ("USD", "USD", "oaa1"),
+        ] {
+            let account = create_test_account("acc-fidelity", "USD");
+            let (service, asset_service) =
+                broker_sync_service(&account, vec![oaa1_without_an_exchange(asset_ccy)]);
+
+            let result = service
+                .prepare_activities_for_sync(
+                    vec![broker_buy(&account.id, symbol, activity_ccy)],
+                    &account,
+                )
+                .await
+                .expect("sync preparation");
+
+            let case = format!("{symbol} in {activity_ccy}, asset in {asset_ccy}");
+            assert!(result.errors.is_empty(), "{case}: {:?}", result.errors);
+            let assets = asset_service.get_assets().unwrap();
+            assert_eq!(assets.len(), 1, "{case}: {assets:?}");
+            assert_linked_to(&result, "oaa1");
+            assert_eq!(assets[0].instrument_exchange_mic, None, "{case}");
+            assert!(
+                asset_service
+                    .resolve_import_asset_input_batches
+                    .lock()
+                    .unwrap()
+                    .is_empty(),
+                "{case}: searched for a listing"
+            );
+        }
+    }
+
+    /// A failed read must not look like an empty portfolio: the search would
+    /// run for a ticker kept without an exchange and could file it on a listing.
+    #[tokio::test]
+    async fn sync_stops_when_the_asset_list_cannot_be_read() {
+        let account = create_test_account("acc-fidelity", "USD");
+        let (service, asset_service) =
+            broker_sync_service(&account, vec![oaa1_without_an_exchange("EUR")]);
+        *asset_service.get_assets_error.lock().unwrap() = Some("database is locked".to_string());
+
+        let result = service
+            .prepare_activities_for_sync(vec![broker_buy(&account.id, "OAA1", "USD")], &account)
+            .await;
+
+        assert!(result.is_err());
+        assert!(asset_service
+            .resolve_import_asset_input_batches
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A blank exchange is no exchange.
+    #[tokio::test]
+    async fn sync_treats_a_blank_exchange_as_no_exchange() {
+        let account = create_test_account("acc-fidelity", "USD");
+        let mut asset = oaa1_without_an_exchange("USD");
+        asset.instrument_exchange_mic = Some("  ".to_string());
+        let (service, asset_service) = broker_sync_service(&account, vec![asset]);
+
+        service
+            .prepare_activities_for_sync(vec![broker_buy(&account.id, "OAA1", "USD")], &account)
+            .await
+            .expect("sync preparation");
+
+        assert!(asset_service
+            .resolve_import_asset_input_batches
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A bare asset next to a listed one must not take over the listed holding:
+    /// its activities stay on the listing and keep their market price.
+    #[tokio::test]
+    async fn sync_keeps_activities_on_a_listing_that_has_a_bare_twin() {
+        let account = create_test_account("acc-eur", "EUR");
+        let mut listed = create_test_asset_with_instrument(
+            "oaa1-xstu",
+            "OAA1",
+            Some("XSTU"),
+            Some(InstrumentType::Equity),
+            "EUR",
+        );
+        listed.instrument_key = Some("EQUITY:OAA1@XSTU".to_string());
+        listed.quote_mode = QuoteMode::Market;
+        let (service, asset_service) =
+            broker_sync_service(&account, vec![listed, oaa1_without_an_exchange("EUR")]);
+
+        let result = service
+            .prepare_activities_for_sync(vec![broker_buy(&account.id, "OAA1", "EUR")], &account)
+            .await
+            .expect("sync preparation");
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_linked_to(&result, "oaa1-xstu");
+        assert_eq!(asset_service.get_assets().unwrap().len(), 2);
+    }
+
+    /// Turning automatic updates off doesn't bring the search back. `OAA1` was
+    /// filed on Stuttgart in EUR, set to manual pricing, then cleared: the next
+    /// sync must not add a second asset on that listing.
+    #[tokio::test]
+    async fn sync_keeps_a_manually_priced_ticker_held_without_an_exchange_off_every_listing() {
+        let account = create_test_account("acc-fidelity", "USD");
+        let mut manual = oaa1_without_an_exchange("EUR");
+        manual.quote_mode = QuoteMode::Manual;
+        let (service, asset_service) = broker_sync_service(&account, vec![manual]);
+
+        let result = service
+            .prepare_activities_for_sync(vec![broker_buy(&account.id, "OAA1", "USD")], &account)
+            .await
+            .expect("sync preparation");
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let assets = asset_service.get_assets().unwrap();
+        assert_eq!(assets.len(), 1, "{assets:?}");
+        assert_linked_to(&result, "oaa1");
+        assert_eq!(assets[0].instrument_exchange_mic, None);
+        assert!(
+            asset_service
+                .resolve_import_asset_input_batches
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "searched for a listing"
+        );
+    }
+
+    /// An exchange the broker sends is a fact, not a guess.
+    #[tokio::test]
+    async fn sync_uses_an_exchange_the_broker_sends_for_a_ticker_held_without_one() {
+        let account = create_test_account("acc-fidelity", "USD");
+        let (service, asset_service) =
+            broker_sync_service(&account, vec![oaa1_without_an_exchange("USD")]);
+        let mut buy = broker_buy(&account.id, "OAA1", "USD");
+        buy.asset.as_mut().unwrap().exchange_mic = Some("XNAS".to_string());
+
+        let result = service
+            .prepare_activities_for_sync(vec![buy], &account)
+            .await
+            .expect("sync preparation");
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let assets = asset_service.get_assets().unwrap();
+        assert!(
+            assets
+                .iter()
+                .any(|asset| asset.instrument_key.as_deref() == Some("EQUITY:OAA1@XNAS")),
+            "{assets:?}"
+        );
+    }
+
+    /// Only a security held without an exchange settles the ticker: a crypto
+    /// asset that happens to share the code says nothing about the listing.
+    #[tokio::test]
+    async fn sync_still_searches_when_only_another_kind_of_asset_shares_the_ticker() {
+        let account = create_test_account("acc-usd", "USD");
+        let mut crypto = create_test_asset_with_instrument(
+            "oaa1-crypto",
+            "OAA1",
+            None,
+            Some(InstrumentType::Crypto),
+            "USD",
+        );
+        crypto.instrument_key = Some("CRYPTO:OAA1/USD".to_string());
+        let (service, asset_service) = broker_sync_service(&account, vec![crypto]);
+
+        let result = service
+            .prepare_activities_for_sync(vec![broker_buy(&account.id, "OAA1", "USD")], &account)
+            .await
+            .expect("sync preparation");
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let assets = asset_service.get_assets().unwrap();
+        assert!(
+            assets
+                .iter()
+                .any(|asset| asset.instrument_key.as_deref() == Some("EQUITY:OAA1@XSTU")),
+            "{assets:?}"
+        );
+    }
+
+    /// One venue decision per symbol: activities of one ticker in different
+    /// currencies land on one asset.
+    #[tokio::test]
+    async fn sync_files_a_ticker_traded_in_two_currencies_on_one_asset() {
+        let account = create_test_account("acc-cad", "CAD");
+        let (service, asset_service) = broker_sync_service(&account, Vec::new());
+
+        let result = service
+            .prepare_activities_for_sync(
+                vec![
+                    broker_buy(&account.id, "OAA1", "USD"),
+                    broker_buy(&account.id, "OAA1", "CAD"),
+                ],
+                &account,
+            )
+            .await
+            .expect("sync preparation");
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let assets = asset_service.get_assets().unwrap();
+        assert_eq!(assets.len(), 1, "{assets:?}");
+        assert_linked_to(&result, &assets[0].id);
+        assert_eq!(
+            assets[0].instrument_key.as_deref(),
+            Some("EQUITY:OAA1@XSTU")
+        );
+    }
+
+    /// An asset already filed under the searched listing keeps its activities,
+    /// so a holding is not split across two assets; the user moves it by
+    /// clearing the asset's exchange.
+    #[tokio::test]
+    async fn sync_keeps_using_an_asset_already_on_the_searched_listing() {
+        let account = create_test_account("acc-fidelity", "USD");
+        let mut existing = create_test_asset_with_instrument(
+            "oaa1-xstu",
+            "OAA1",
+            Some("XSTU"),
+            Some(InstrumentType::Equity),
+            "EUR",
+        );
+        existing.instrument_key = Some("EQUITY:OAA1@XSTU".to_string());
+        let (service, asset_service) = broker_sync_service(&account, vec![existing]);
+
+        let result = service
+            .prepare_activities_for_sync(vec![broker_buy(&account.id, "OAA1", "USD")], &account)
+            .await
+            .expect("sync preparation");
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            result.prepared[0].activity.get_symbol_id(),
+            Some("oaa1-xstu")
+        );
+        assert_eq!(asset_service.get_assets().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -6199,6 +6764,148 @@ pub(crate) mod tests {
             .contains("DEPOSIT activities are not supported for credit card accounts"));
     }
 
+    /// A card holds no deposits, so a payment saved as a refund/credit is
+    /// reclassified straight to TRANSFER_IN and back, with the same transfer
+    /// metadata handling as a deposit (#2740).
+    #[tokio::test]
+    async fn credit_card_refund_and_payment_reclassify_both_ways() {
+        let account_service = Arc::new(MockAccountService::new());
+        let mut account = create_test_account("card-1", "USD");
+        account.account_type = "CREDIT_CARD".to_string();
+        account_service.add_account(account);
+        let activity_service = ActivityService::new(
+            Arc::new(MockActivityRepository::new()),
+            account_service,
+            Arc::new(MockAssetService::new()),
+            Arc::new(MockFxService::new()),
+            Arc::new(MockQuoteService),
+        );
+        activity_service
+            .create_activity(NewActivity {
+                subtype: Some("REFUND".to_string()),
+                ..create_test_cash_create("card-payment", "card-1", "CREDIT", "USD")
+            })
+            .await
+            .expect("credit cards accept CREDIT");
+
+        let mut update = create_test_activity_update("card-payment", "card-1", None, "USD");
+        update.activity_type = "TRANSFER_IN".to_string();
+        update.quantity = None;
+        update.unit_price = None;
+        update.fee = None;
+        update.amount = None;
+        let payment = activity_service
+            .update_activity(update.clone())
+            .await
+            .expect("a card refund becomes a payment");
+        assert_eq!(payment.activity_type, "TRANSFER_IN");
+        assert_eq!(payment.subtype, None);
+        assert_eq!(payment.amount, Some(dec!(100)));
+        assert_eq!(
+            payment
+                .metadata
+                .as_ref()
+                .and_then(|m| m.pointer("/flow/is_external")),
+            Some(&json!(true))
+        );
+
+        update.activity_type = "CREDIT".to_string();
+        let refund = activity_service
+            .update_activity(update)
+            .await
+            .expect("a card payment becomes a refund again");
+        assert_eq!(refund.activity_type, "CREDIT");
+        assert_eq!(refund.amount, Some(dec!(100)));
+        assert!(refund
+            .metadata
+            .as_ref()
+            .and_then(|m| m.pointer("/flow/is_external"))
+            .is_none());
+    }
+
+    /// A card's payment moved to a bank as a refund is the bank's refund: it
+    /// keeps the subtype the edit sends, and loses its transfer flags.
+    #[tokio::test]
+    async fn card_payment_moved_to_a_bank_as_a_refund_keeps_its_subtype() {
+        let account_service = Arc::new(MockAccountService::new());
+        let mut card = create_test_account("card-1", "USD");
+        card.account_type = "CREDIT_CARD".to_string();
+        account_service.add_account(card);
+        account_service.add_account(create_test_account("bank-1", "USD"));
+        let activity_service = ActivityService::new(
+            Arc::new(MockActivityRepository::new()),
+            account_service,
+            Arc::new(MockAssetService::new()),
+            Arc::new(MockFxService::new()),
+            Arc::new(MockQuoteService),
+        );
+        activity_service
+            .create_activity(NewActivity {
+                metadata: Some(json!({"flow": {"is_external": true}}).to_string()),
+                ..create_test_cash_create("card-payment", "card-1", "TRANSFER_IN", "USD")
+            })
+            .await
+            .expect("cards accept a payment");
+
+        let mut update = create_test_activity_update("card-payment", "bank-1", None, "USD");
+        update.activity_type = "CREDIT".to_string();
+        update.subtype = Some("REIMBURSEMENT".to_string());
+        update.quantity = None;
+        update.unit_price = None;
+        update.fee = None;
+        update.amount = None;
+        let refund = activity_service
+            .update_activity(update)
+            .await
+            .expect("the payment becomes the bank's refund");
+        assert_eq!(refund.account_id, "bank-1");
+        assert_eq!(refund.activity_type, "CREDIT");
+        assert_eq!(refund.subtype.as_deref(), Some("REIMBURSEMENT"));
+        assert!(refund
+            .metadata
+            .as_ref()
+            .and_then(|m| m.pointer("/flow/is_external"))
+            .is_none());
+    }
+
+    /// On a bank a credit is income or a refund: turning a one-sided transfer
+    /// into one keeps the subtype the edit sends, unlike a card's payment.
+    #[tokio::test]
+    async fn bank_transfer_in_becoming_a_credit_keeps_its_subtype() {
+        let account_service = Arc::new(MockAccountService::new());
+        account_service.add_account(create_test_account("bank-1", "USD"));
+        let activity_service = ActivityService::new(
+            Arc::new(MockActivityRepository::new()),
+            account_service,
+            Arc::new(MockAssetService::new()),
+            Arc::new(MockFxService::new()),
+            Arc::new(MockQuoteService),
+        );
+        activity_service
+            .create_activity(create_test_cash_create(
+                "bank-in",
+                "bank-1",
+                "TRANSFER_IN",
+                "USD",
+            ))
+            .await
+            .expect("banks accept TRANSFER_IN");
+
+        let mut update = create_test_activity_update("bank-in", "bank-1", None, "USD");
+        update.activity_type = "CREDIT".to_string();
+        update.subtype = Some("REIMBURSEMENT".to_string());
+        update.quantity = None;
+        update.unit_price = None;
+        update.fee = None;
+        update.amount = None;
+        let credit = activity_service
+            .update_activity(update)
+            .await
+            .expect("a bank transfer becomes a credit");
+        assert_eq!(credit.activity_type, "CREDIT");
+        assert_eq!(credit.subtype.as_deref(), Some("REIMBURSEMENT"));
+    }
+
     /// A security transfer on a card account: TRANSFER_IN/OUT with an asset.
     fn create_test_card_security_transfer(id: &str, activity_type: &str) -> NewActivity {
         NewActivity {
@@ -7084,6 +7791,8 @@ pub(crate) mod tests {
             "error should clearly explain duplicate detection: {}",
             err
         );
+        // Clients get a specific refusal, not the generic internal error.
+        assert_eq!(err.public_error().error_code, "DUPLICATE_ACTIVITY");
     }
 
     #[tokio::test]
@@ -11391,6 +12100,7 @@ pub(crate) mod tests {
                     isin: Some("ca82509l1076".to_string()),
                     provider_id: None,
                     provider_symbol: None,
+                    name: None,
                 },
                 ImportAssetCandidate {
                     key: "shop-2".to_string(),
@@ -11404,6 +12114,7 @@ pub(crate) mod tests {
                     isin: Some("CA82509L1077".to_string()),
                     provider_id: None,
                     provider_symbol: None,
+                    name: None,
                 },
             ])
             .await
@@ -11448,6 +12159,7 @@ pub(crate) mod tests {
                 isin: None,
                 provider_id: None,
                 provider_symbol: None,
+                name: None,
             }])
             .await
             .expect("preview should succeed");
@@ -11497,6 +12209,7 @@ pub(crate) mod tests {
                 isin: None,
                 provider_id: Some("METAL_PRICE_API".to_string()),
                 provider_symbol: Some("XAU-1KG".to_string()),
+                name: None,
             }])
             .await
             .expect("preview should succeed");
@@ -12101,6 +12814,7 @@ pub(crate) mod tests {
             isin: None,
             provider_id: provider_id.map(str::to_string),
             provider_symbol: provider_id.map(|_| symbol.to_string()),
+            name: None,
         }
     }
 
@@ -14189,6 +14903,7 @@ pub(crate) mod tests {
                 activity_id: "source-out".to_string(),
                 window_days: Some(7),
                 limit: Some(25),
+                include_cash_flows: false,
             })
             .expect("candidate search should succeed");
 
@@ -14262,6 +14977,7 @@ pub(crate) mod tests {
                 activity_id: "source-out".to_string(),
                 window_days: Some(7),
                 limit: Some(25),
+                include_cash_flows: false,
             })
             .expect("candidate search should succeed");
 
@@ -14436,6 +15152,7 @@ pub(crate) mod tests {
                     activity_id: transfer.activity.id.clone(),
                     window_days: Some(7),
                     limit: Some(3),
+                    include_cash_flows: false,
                 })
                 .expect("candidates");
             let ids = |candidates: &[TransferMatchCandidate]| {
@@ -14617,6 +15334,84 @@ pub(crate) mod tests {
         let mut pair = [left.to_string(), right.to_string()];
         pair.sort();
         pair
+    }
+
+    /// A sync can save a card payment's card side as a refund or credit. The
+    /// review suggests it when the same amount left a non-card account, but
+    /// never as certain: a real refund can match a withdrawal by chance.
+    #[tokio::test]
+    async fn review_suggests_a_card_credit_matching_a_bank_withdrawal() {
+        let mut second_card = create_test_account("card-2", "USD");
+        second_card.account_type = crate::accounts::account_types::CREDIT_CARD.to_string();
+        let mut inactive_card = create_test_account("card-3", "USD");
+        inactive_card.account_type = crate::accounts::account_types::CREDIT_CARD.to_string();
+        inactive_card.is_active = false;
+        let mut card = create_test_account("card", "USD");
+        card.account_type = crate::accounts::account_types::CREDIT_CARD.to_string();
+        let (service, _) = convert_test_service_with_accounts(
+            vec![
+                review_leg(
+                    "card-credit",
+                    "card",
+                    "CREDIT",
+                    "2024-03-01T12:00:00Z",
+                    dec!(450),
+                ),
+                review_leg(
+                    "bank-out",
+                    "bank",
+                    "WITHDRAWAL",
+                    "2024-03-02T12:00:00Z",
+                    dec!(450),
+                ),
+                // Another card's charge is spending, not the payment's other side.
+                review_leg(
+                    "card-2-charge",
+                    "card-2",
+                    "WITHDRAWAL",
+                    "2024-03-01T12:00:00Z",
+                    dec!(450),
+                ),
+                // So is an inactive card's.
+                review_leg(
+                    "card-3-charge",
+                    "card-3",
+                    "WITHDRAWAL",
+                    "2024-03-01T12:00:00Z",
+                    dec!(450),
+                ),
+                // A refund with nothing matching stays a refund.
+                review_leg(
+                    "lone-refund",
+                    "card",
+                    "CREDIT",
+                    "2024-03-05T12:00:00Z",
+                    dec!(80),
+                ),
+                // A bank's credit is income or a refund, never a card payment.
+                review_leg(
+                    "bank-credit",
+                    "bank",
+                    "CREDIT",
+                    "2024-03-01T12:00:00Z",
+                    dec!(450),
+                ),
+            ],
+            vec![
+                card,
+                second_card,
+                inactive_card,
+                create_test_account("bank", "USD"),
+            ],
+        );
+
+        let review = service.review_transfer_matches().await.expect("review");
+
+        assert!(review.certain.is_empty());
+        assert_eq!(
+            review_rows(&review),
+            vec![("card-credit", vec!["bank-out"])]
+        );
     }
 
     /// Legs that certain pairs take are dropped before the review keeps a
@@ -14897,6 +15692,7 @@ pub(crate) mod tests {
                     activity_id: activity_id.to_string(),
                     window_days: Some(7),
                     limit: Some(25),
+                    include_cash_flows: false,
                 })
                 .expect("candidates")
                 .into_iter()
@@ -15249,6 +16045,7 @@ pub(crate) mod tests {
                 activity_id: "security-out".to_string(),
                 window_days: Some(7),
                 limit: Some(25),
+                include_cash_flows: false,
             })
             .expect("candidate search should succeed");
 
@@ -15460,9 +16257,22 @@ pub(crate) mod tests {
         activities: Vec<Activity>,
         accounts: &[(&str, &str)],
     ) -> (ActivityService, Arc<MockActivityRepository>) {
+        convert_test_service_with_accounts(
+            activities,
+            accounts
+                .iter()
+                .map(|(id, currency)| create_test_account(id, currency))
+                .collect(),
+        )
+    }
+
+    fn convert_test_service_with_accounts(
+        activities: Vec<Activity>,
+        accounts: Vec<Account>,
+    ) -> (ActivityService, Arc<MockActivityRepository>) {
         let account_service = Arc::new(MockAccountService::new());
-        for (id, currency) in accounts {
-            account_service.add_account(create_test_account(id, currency));
+        for account in accounts {
+            account_service.add_account(account);
         }
         let activity_repository = Arc::new(MockActivityRepository::new());
         for activity in activities {
@@ -15476,6 +16286,36 @@ pub(crate) mod tests {
             Arc::new(MockQuoteService),
         );
         (service, activity_repository)
+    }
+
+    #[tokio::test]
+    async fn convert_to_internal_transfer_reports_a_racing_duplicate_leg() {
+        let withdrawal = create_cash_transfer_activity(
+            "withdrawal",
+            "acc-join",
+            ACTIVITY_TYPE_WITHDRAWAL,
+            "2026-10-23T00:00:00Z",
+            dec!(500),
+            "CAD",
+        );
+        let (service, repository) = convert_test_service(
+            vec![withdrawal],
+            &[("acc-join", "CAD"), ("acc-cibc", "CAD")],
+        );
+        repository.fail_writes_with_idempotency_conflict();
+
+        let err = service
+            .convert_to_internal_transfer(ConvertToTransferRequest {
+                activity_id: "withdrawal".to_string(),
+                counterpart_activity_id: None,
+                counterpart_account_id: Some("acc-cibc".to_string()),
+                counterpart_amount: None,
+                split_review: None,
+            })
+            .await
+            .expect_err("a leg stored meanwhile is a duplicate");
+
+        assert_eq!(err.public_error().error_code, "DUPLICATE_ACTIVITY");
     }
 
     #[tokio::test]
@@ -15566,6 +16406,7 @@ pub(crate) mod tests {
                 activity_id: "withdrawal".to_string(),
                 window_days: None,
                 limit: None,
+                include_cash_flows: false,
             })
             .expect("a withdrawal has candidates");
         assert_eq!(candidates.len(), 1);
@@ -15590,6 +16431,164 @@ pub(crate) mod tests {
             parse_test_activity_datetime("2026-10-24T00:00:00Z")
         );
         assert_eq!(repository.activities.lock().unwrap().len(), 2);
+    }
+
+    fn card_and_bank_accounts() -> Vec<Account> {
+        let mut card = create_test_account("card", "CAD");
+        card.account_type = crate::accounts::account_types::CREDIT_CARD.to_string();
+        vec![card, create_test_account("bank", "CAD")]
+    }
+
+    #[tokio::test]
+    async fn convert_to_internal_transfer_turns_a_card_credit_into_its_payment() {
+        let mut card_credit = create_cash_transfer_activity(
+            "card-credit",
+            "card",
+            ACTIVITY_TYPE_CREDIT,
+            "2026-11-01T00:00:00Z",
+            dec!(450),
+            "CAD",
+        );
+        card_credit.subtype = Some("REFUND".to_string());
+        let (service, _) = convert_test_service_with_accounts(
+            vec![
+                card_credit,
+                create_cash_transfer_activity(
+                    "bank-withdrawal",
+                    "bank",
+                    ACTIVITY_TYPE_WITHDRAWAL,
+                    "2026-11-01T00:00:00Z",
+                    dec!(450),
+                    "CAD",
+                ),
+                create_cash_transfer_activity(
+                    "bank-credit",
+                    "bank",
+                    ACTIVITY_TYPE_CREDIT,
+                    "2026-11-01T00:00:00Z",
+                    dec!(450),
+                    "CAD",
+                ),
+            ],
+            card_and_bank_accounts(),
+        );
+
+        let candidates = service
+            .find_transfer_match_candidates(TransferMatchCandidateRequest {
+                activity_id: "card-credit".to_string(),
+                window_days: None,
+                limit: None,
+                include_cash_flows: false,
+            })
+            .expect("a card credit has candidates");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].activity.id, "bank-withdrawal");
+
+        let pair = service
+            .convert_to_internal_transfer(ConvertToTransferRequest {
+                activity_id: "card-credit".to_string(),
+                counterpart_activity_id: Some("bank-withdrawal".to_string()),
+                counterpart_account_id: None,
+                counterpart_amount: None,
+                split_review: None,
+            })
+            .await
+            .expect("a card credit becomes the card's payment");
+        assert_eq!(pair.transfer_in.id, "card-credit");
+        assert_eq!(pair.transfer_in.effective_type(), ACTIVITY_TYPE_TRANSFER_IN);
+        assert_eq!(pair.transfer_out.id, "bank-withdrawal");
+        assert_eq!(
+            pair.transfer_out.effective_type(),
+            ACTIVITY_TYPE_TRANSFER_OUT
+        );
+
+        // A bank account's credit is income or a refund, never a payment.
+        assert!(service
+            .find_transfer_match_candidates(TransferMatchCandidateRequest {
+                activity_id: "bank-credit".to_string(),
+                window_days: None,
+                limit: None,
+                include_cash_flows: false,
+            })
+            .is_err());
+        assert!(service
+            .convert_to_internal_transfer(ConvertToTransferRequest {
+                activity_id: "bank-credit".to_string(),
+                counterpart_activity_id: None,
+                counterpart_account_id: Some("card".to_string()),
+                counterpart_amount: None,
+                split_review: None,
+            })
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn cash_transfer_candidates_include_cash_flows_only_when_asked() {
+        let (service, _) = convert_test_service_with_accounts(
+            vec![
+                create_cash_transfer_activity(
+                    "card-payment",
+                    "card",
+                    ACTIVITY_TYPE_TRANSFER_IN,
+                    "2026-11-01T00:00:00Z",
+                    dec!(450),
+                    "CAD",
+                ),
+                create_cash_transfer_activity(
+                    "bank-withdrawal",
+                    "bank",
+                    ACTIVITY_TYPE_WITHDRAWAL,
+                    "2026-11-01T00:00:00Z",
+                    dec!(450),
+                    "CAD",
+                ),
+                // A withdrawal carrying a security cannot be converted.
+                Activity {
+                    asset_id: Some("AAPL".to_string()),
+                    ..create_cash_transfer_activity(
+                        "bank-share-withdrawal",
+                        "bank",
+                        ACTIVITY_TYPE_WITHDRAWAL,
+                        "2026-11-01T00:00:00Z",
+                        dec!(450),
+                        "CAD",
+                    )
+                },
+            ],
+            card_and_bank_accounts(),
+        );
+        let candidates = |include_cash_flows| {
+            service
+                .find_transfer_match_candidates(TransferMatchCandidateRequest {
+                    activity_id: "card-payment".to_string(),
+                    window_days: None,
+                    limit: None,
+                    include_cash_flows,
+                })
+                .expect("a transfer has candidates")
+        };
+        assert!(candidates(false).is_empty());
+        let with_cash_flows = candidates(true);
+        assert_eq!(with_cash_flows.len(), 1);
+        assert_eq!(with_cash_flows[0].activity.id, "bank-withdrawal");
+
+        let pair = service
+            .convert_to_internal_transfer(ConvertToTransferRequest {
+                activity_id: "card-payment".to_string(),
+                counterpart_activity_id: Some("bank-withdrawal".to_string()),
+                counterpart_account_id: None,
+                counterpart_amount: None,
+                split_review: None,
+            })
+            .await
+            .expect("the payment pairs with the bank's withdrawal");
+        assert_eq!(pair.transfer_in.id, "card-payment");
+        assert_eq!(pair.transfer_out.id, "bank-withdrawal");
+        assert_eq!(
+            pair.transfer_out.effective_type(),
+            ACTIVITY_TYPE_TRANSFER_OUT
+        );
     }
 
     #[tokio::test]
@@ -16916,6 +17915,68 @@ pub(crate) mod tests {
         assert_eq!(result.summary.imported, 1);
         assert_eq!(result.summary.duplicates, 0);
         assert_eq!(repository.get_activities().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_import_reports_a_racing_duplicate_as_duplicate() {
+        let account_service = Arc::new(MockAccountService::new());
+        account_service.add_account(create_test_account("acc-1", "GBP"));
+        let activity_repository = Arc::new(MockActivityRepository::new());
+        activity_repository.fail_writes_with_idempotency_conflict();
+        let activity_service = ActivityService::new(
+            activity_repository.clone(),
+            account_service,
+            Arc::new(MockAssetService::new()),
+            Arc::new(MockFxService::new()),
+            Arc::new(MockQuoteService),
+        );
+
+        let row = ActivityImport {
+            id: None,
+            date: "2024-01-15".to_string(),
+            symbol: "VWRL".to_string(),
+            activity_type: "BUY".to_string(),
+            quantity: Some(dec!(1)),
+            unit_price: Some(dec!(100)),
+            currency: "GBP".to_string(),
+            fee: Some(dec!(0)),
+            tax: None,
+            amount: Some(dec!(100)),
+            comment: None,
+            account_id: Some("acc-1".to_string()),
+            account_name: None,
+            symbol_name: Some("Vanguard FTSE All-World".to_string()),
+            exchange_mic: Some("XLON".to_string()),
+            quote_ccy: Some("GBP".to_string()),
+            instrument_type: Some("EQUITY".to_string()),
+            quote_mode: Some("MARKET".to_string()),
+            provider_id: None,
+            provider_symbol: None,
+            errors: None,
+            warnings: None,
+            duplicate_of_id: None,
+            duplicate_of_line_number: None,
+            is_draft: false,
+            is_valid: true,
+            line_number: Some(1),
+            fx_rate: None,
+            subtype: None,
+            asset_id: None,
+            isin: None,
+            force_import: false,
+            is_external: None,
+            source_group_id: None,
+            charges: None,
+            source_record_id: None,
+            metadata: None,
+        };
+
+        let err = activity_service
+            .import_activities(vec![row])
+            .await
+            .expect_err("a row stored meanwhile is a duplicate");
+
+        assert_eq!(err.public_error().error_code, "DUPLICATE_ACTIVITY");
     }
 
     #[tokio::test]

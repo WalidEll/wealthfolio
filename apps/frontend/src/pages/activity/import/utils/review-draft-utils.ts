@@ -1,6 +1,10 @@
 import { ActivityType } from "@/lib/constants";
 import { isAssetBackedIncomeSubtype } from "@/lib/activity-utils";
-import { resolveNumericDecimalSeparator } from "./numeric-format";
+import {
+  normalizeMinusSign,
+  resolveNumericDecimalSeparator,
+  stripCurrencyLabel,
+} from "./numeric-format";
 
 /**
  * Parse a numeric value from a string, handling various formats.
@@ -13,17 +17,18 @@ export function parseSignedNumericValue(
 ): string | undefined {
   if (!value || value.trim() === "") return undefined;
 
-  let normalized = value.trim();
+  let normalized = normalizeMinusSign(value);
   let isNegative = false;
 
   if (normalized.startsWith("(") && normalized.endsWith(")")) {
     isNegative = true;
     normalized = normalized.slice(1, -1);
   }
+  normalized = stripCurrencyLabel(normalized);
 
   let mantissa = normalized;
   let exponent = "";
-  const exponentMatch = /[\d.,][eE]([+-]?\d+)[^\d]*$/.exec(normalized);
+  const exponentMatch = /[\d.,][eE]([+-]?\d+)[^\d+-]*$/.exec(normalized);
   if (exponentMatch) {
     mantissa = normalized.slice(0, exponentMatch.index + 1);
     exponent = exponentMatch[1];
